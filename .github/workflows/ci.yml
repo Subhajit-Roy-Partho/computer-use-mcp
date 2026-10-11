@@ -274,7 +274,7 @@ jobs:
               "dist/launch.js", "dist/env.js", "dist/instructions.js", "dist/entrypoint.js",
               "dist/session/agent-desktop-handlers.js", "dist/session/macos-helper.js", "dist/session/pid-delivery.js",
               "dist/session/user-activity.js", "dist/session/window-select.js", "dist/session/keys.js", "dist/session/input-handlers.js",
-              "libexec/macos-agent-helper.swift", "docs/releases/v7.5.0.md", "docs/releases/v7.6.0.md",
+              "libexec/macos-agent-helper.swift", "docs/releases/v7.5.0.md", "docs/releases/v7.6.0.md", "docs/releases/v7.6.1.md",
               "dist/session/input-handlers.js",
               "dist/session/scripting-service.js",
               "dist/session/openai-handler.js",
@@ -435,7 +435,20 @@ jobs:
             fi
             echo "@zavora-ai/computer-use-mcp@$ver already published with identical integrity — skipping"
           else
-            npm stage publish "$archive" --access public --provenance
+            # 7.6.1: a version staged and awaiting approval is not an error either (run 37926218430 failed with
+            # E409 "Cannot stage previously published version" while 7.6.0 was pending, and the next push staged it twice).
+            set +e
+            output=$(npm stage publish "$archive" --access public --provenance 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -ne 0 ]; then
+              if printf '%s' "$output" | grep -q "E409\|Cannot stage previously published version\|already staged"; then
+                echo "::warning::@zavora-ai/computer-use-mcp@$ver is already staged and awaiting approval; nothing staged again."
+                exit 0
+              fi
+              exit "$status"
+            fi
           fi
         env:
           NODE_AUTH_TOKEN: ''
