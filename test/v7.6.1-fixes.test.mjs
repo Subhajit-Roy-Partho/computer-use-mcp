@@ -102,7 +102,9 @@ test('F2: an unknown argument is refused by name with the nearest declared one; 
     assert.equal(alias.isError, undefined, 'the aliases keep accepting click\'s targeting')
     const scroll = await client.callTool('scroll', { coordinate: [10, 10], direction: 'down', delta_y: 2 })
     assert.equal(scroll.isError, undefined, 'scroll keeps its undeclared deltas')
-    const token = await client.callTool('write_clipboard', { text: 'x', approval_token: 'not-configured' })
+    // A mutating tool that touches nothing on any platform (the clipboard shells out to pbcopy on macOS and
+    // needs a native clipboard elsewhere, so it is not portable in a fake-native test).
+    const token = await client.callTool('agent_pointer', { action: 'move', coordinate: [5, 5], native_overlay: false, approval_token: 'not-configured' })
     assert.equal(token.isError, undefined, 'approval_token stays accepted as an undeclared argument')
   } finally { await client.close() }
 })
