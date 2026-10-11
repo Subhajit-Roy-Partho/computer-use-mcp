@@ -84,8 +84,8 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked`/
 |---|---|---|---|
 | F1 | Reply to issue #36 (per-platform packages) | done | posted 2026-10-11: https://github.com/zavora-ai/computer-use-mcp/issues/36#issuecomment-6113242533 |
 | F2 | Reply to issue #21 (Linux AT-SPI) | done | posted 2026-10-11: https://github.com/zavora-ai/computer-use-mcp/issues/21#issuecomment-6113242751 |
-| F3 | Review comment on PR #40 | needs James | see §Drafts |
-| F4 | Commit and PR for 7.6.1 | needs James | |
+| F3 | Review comment on PR #40 | done | posted 2026-10-11 on #40, pointing at #41 and asking for a Windows run; closing #40 is the contributor's and James's call |
+| F4 | Commit and PR for 7.6.1 | done | branch `release/v7.6.1`, commit e76d350, https://github.com/zavora-ai/computer-use-mcp/pull/41; version bumped to 7.6.1, release note `docs/releases/v7.6.1.md` |
 
 ## Drafts
 
