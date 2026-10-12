@@ -100,3 +100,5 @@ failed on every desktop step because James was typing his next message and the u
 (correct); the test now waits for the keyboard to go quiet. Calculator's accessibility values carry U+200E marks around
 each glyph ("‎3"), which the test strips; OCR read the large result glyph as "9", so the accessibility value is the
 check that counts.
+
+**CI on #41 (2026-10-12):** the Windows test jobs failed on the new packaging test (a `file:` URL pathname is not a Windows path; fixed with `fileURLToPath`), and the Linux test jobs failed in the input smoke step: `multi_select` now validates coordinates, which asks the display size, and the runner had no X server (review T6: the smoke used to pass by doing nothing). The Linux job now runs that step under Xvfb with the X11 tools installed.

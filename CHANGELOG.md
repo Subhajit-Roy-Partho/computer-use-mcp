@@ -66,6 +66,9 @@ The 7.6.1 list from [the 2026-10-11 review](docs/reviews/2026-10-11-end-to-end-r
   tarball while every test job stayed green; a packaging test now asserts every runtime import inside `dist` resolves.
 - The release workflow skips with a warning when the version is already staged and awaiting approval (it failed with
   E409 and the next push staged the same version twice).
+- The Linux CI test job runs the input smoke test under Xvfb with `xdotool`, `wmctrl` and `xclip` installed. It used to
+  pass with no X server because the native layer returned silently; coordinate validation now needs a display, so the
+  clicks are real.
 
 ## v7.6.0 (2026-10-09)
 
