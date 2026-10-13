@@ -83,6 +83,27 @@ jobs:
           path: ${{ matrix.target.artifact }}
           if-no-files-found: error
 
+  platform-packages:
+    name: Pack all six native platform packages
+    needs: build-native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: computer-use-napi.*.node
+          merge-multiple: true
+      - name: Synchronize versions, require every artifact, and verify tarball contents
+        run: npm run pack:platforms
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-platform-packages
+          path: release/platform/
+          if-no-files-found: error
+
   lint:
     name: Lint TypeScript
     runs-on: ubuntu-latest
@@ -152,7 +173,7 @@ jobs:
 
   test:
     name: Test — ${{ matrix.os.name }}
-    needs: build-native
+    needs: [build-native, platform-packages]
     runs-on: ${{ matrix.os.runner }}
     strategy:
       fail-fast: false
@@ -197,17 +218,42 @@ jobs:
       - name: Build TypeScript
         run: npx tsc
 
+      - name: Verify the current source build addon loads
+        run: node scripts/verify-local-native.mjs
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
+
       - name: Run full test suite (all platforms)
         shell: bash
         run: node --test test/*.test.mjs
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
+
+      - name: Download packed native packages
+        uses: actions/download-artifact@v4
+        with:
+          name: native-platform-packages
+          path: release/platform
+
+      - name: Verify automatic optional package installation and native loading
+        run: node test/platform-install.mjs
 
       - name: Run smoke test (Windows)
         if: runner.os == 'Windows'
-        run: node test/smoke-windows.mjs
+        shell: bash
+        run: |
+          node scripts/verify-local-native.mjs
+          node test/smoke-windows.mjs
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
 
       - name: Run smoke test (Linux)
         if: runner.os == 'Linux'
-        run: node -e "const { loadNative } = await import('./dist/native.js'); const n = loadNative(); const c = n.getInputMonitorCapability(); if (typeof c.supported !== 'boolean' || c.distinguishesInjected !== false) throw new Error('invalid honest Linux input-monitor capability'); console.log('Native module loaded:', Object.keys(n).length, 'functions; input monitor:', c)"
+        run: |
+          node scripts/verify-local-native.mjs
+          node -e "const { loadNative } = await import('./dist/native.js'); const n = loadNative(); const c = n.getInputMonitorCapability(); if (typeof c.supported !== 'boolean' || c.distinguishesInjected !== false) throw new Error('invalid honest Linux input-monitor capability'); console.log('Native module loaded:', Object.keys(n).length, 'functions; input monitor:', c)"
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
 
       # 7.6.1: the input smoke used to "pass" on Linux with no X server because the native layer returned silently;
       # coordinate validation now asks the display for its size, so the clicks need a display. Xvfb gives them a real one.
@@ -217,11 +263,20 @@ jobs:
 
       - name: Run new tools smoke test (Linux, under Xvfb)
         if: runner.os == 'Linux'
-        run: xvfb-run -a --server-args="-screen 0 1280x800x24" node test/smoke-new-tools.mjs
+        run: |
+          node scripts/verify-local-native.mjs
+          xvfb-run -a --server-args="-screen 0 1280x800x24" node test/smoke-new-tools.mjs
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
 
       - name: Run new tools smoke test
         if: runner.os != 'Linux'
-        run: node test/smoke-new-tools.mjs
+        shell: bash
+        run: |
+          node scripts/verify-local-native.mjs
+          node test/smoke-new-tools.mjs
+        env:
+          COMPUTER_USE_NATIVE_PATH: ${{ github.workspace }}/${{ matrix.os.binary }}
 
   package:
     name: Verify package contents
@@ -334,9 +389,9 @@ jobs:
 
   publish:
     name: Stage npm release for approval
-    needs: [build-native, lint, native-checks, test, package, install-matrix]
+    needs: [build-native, platform-packages, lint, native-checks, test, package, install-matrix]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.repository == 'zavora-ai/computer-use-mcp' && github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
       contents: read
       id-token: write
@@ -349,6 +404,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
+          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: npm ci --ignore-scripts --force
@@ -357,7 +413,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: .
+          pattern: computer-use-napi.*.node
           merge-multiple: true
+
+      - name: Download exact tested platform tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: native-platform-packages
+          path: release/platform
 
       - name: Verify binaries exist
         run: |
@@ -395,8 +458,10 @@ jobs:
             process.stdin.on("data", chunk => source += chunk);
             process.stdin.on("end", () => {
               const manifest = JSON.parse(source);
-              if (Object.keys(manifest.optionalDependencies ?? {}).some(name => name.startsWith("@zavora-ai/computer-use-mcp-"))) {
-                throw new Error("staged universal package must not reference unbootstrapped optional packages");
+              for (const target of ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64"]) {
+                if (manifest.optionalDependencies?.[`@zavora-ai/computer-use-mcp-${target}`] !== manifest.version) {
+                  throw new Error(`optional native package ${target} must match the main version`);
+                }
               }
               console.log("universal tarball contains all six native targets");
             });
@@ -411,6 +476,7 @@ jobs:
           subject-path: |
             computer-use-napi.*.node
             release/root/*.tgz
+            release/platform/*.tgz
 
       - name: Attach SBOM attestation to the exact main tarball
         uses: actions/attest-sbom@v2
@@ -426,6 +492,13 @@ jobs:
             release/
             release-sbom.cdx.json
           if-no-files-found: error
+
+      # New npm names need a maintainer session or stage-only token once, before
+      # trusted publishing can be configured. OIDC handles subsequent releases.
+      - name: Stage all native packages with provenance for maintainer approval
+        run: node scripts/stage-platform-packages.mjs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_NATIVE_STAGE_TOKEN }}
 
       - name: Stage main package for maintainer approval
         run: |
@@ -446,18 +519,15 @@ jobs:
             fi
             echo "@zavora-ai/computer-use-mcp@$ver already published with identical integrity — skipping"
           else
-            # 7.6.1: a version staged and awaiting approval is not an error either (run 37926218430 failed with
-            # E409 "Cannot stage previously published version" while 7.6.0 was pending, and the next push staged it twice).
             set +e
             output=$(npm stage publish "$archive" --access public --provenance 2>&1)
             status=$?
             set -e
             printf '%s\n' "$output"
             if [ "$status" -ne 0 ]; then
-              if printf '%s' "$output" | grep -q "E409\|Cannot stage previously published version\|already staged"; then
-                echo "::warning::@zavora-ai/computer-use-mcp@$ver is already staged and awaiting approval; nothing staged again."
-                exit 0
-              fi
+              commit=${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || printf unavailable)}
+              integrity=$(node -e "const fs=require('fs'),c=require('crypto'); process.stdout.write('sha512-'+c.createHash('sha512').update(fs.readFileSync(process.argv[1])).digest('base64'))" "$archive")
+              echo "::error::Cannot stage @zavora-ai/computer-use-mcp@$ver; commit=$commit artifact=$archive integrity=$integrity evidence=release-evidence-$commit. Verify any pending tarball before approval."
               exit "$status"
             fi
           fi
