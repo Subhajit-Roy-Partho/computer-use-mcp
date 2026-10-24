@@ -38,20 +38,20 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 |---|---|---|---|---|
 | W1 | Absolute input normalised over the virtual desktop (`MOUSEEVENTF_VIRTUALDESK`), rounded | done | `mouse.rs` `normalize_absolute`, `MOUSEEVENTF_VIRTUALDESK` | Rust mouse::tests (3) |
 | W2 | `SendInput` counts checked; blocked input (UIPI) is a typed refusal, not success | done | `keyboard.rs` `send_inputs`: fewer events inserted than sent is `input_blocked` | cargo check (Windows); CI |
-| W3 | DXGI warm-up frame copied; GDI `BitBlt`/`GetDIBits` results checked | todo | | |
-| W4 | `prepare_display` skips cloaked, tool, owned and shell/input windows; restores exactly the windows it minimised | todo | | |
+| W3 | DXGI warm-up frame copied; GDI `BitBlt`/`GetDIBits` results checked | done | `capture_win.rs`: the first duplicated frame is copied before any map; every `BitBlt` and `GetDIBits` result checked | cargo check (Windows); Rust capture_win tests on CI |
+| W4 | `prepare_display` skips cloaked, tool, owned and shell/input windows; restores exactly the windows it minimised | done | `win_util.rs` `is_app_window`; `apps.rs` records the windows it minimised and `unhide_app` restores exactly those, without activating | cargo check (Windows); CI; hardware check before tagging |
 | W5 | `multi_edit` newlines as Enter, not Unicode 0x0A | done | `keyboard.rs` Windows `type_text`: `\n` as VK_RETURN, `\r` skipped | cargo check (Windows); CI |
 | W6 | PowerShell output forced to UTF-8; output decoded across chunk boundaries | done | `scripting-service.ts` `POWERSHELL_UTF8_PREFIX`, every Windows script encoded; `spawn.ts` `StringDecoder` per stream | session-scripting-service; v7.7-spawn |
 | W7 | UI Automation through `CUIAutomation8` with 2 s connection and 5 s transaction timeouts | todo | | |
-| W8 | The user-active guard ignores zero-delta mouse moves | todo | | |
+| W8 | The user-active guard ignores zero-delta mouse moves | done | `activity.rs`: zero-length moves are not activity (Windows hook, macOS tap, Linux XI2) | cargo check (3 targets) |
 
 ## M. macOS and Linux hygiene (7.6.2 order 8–10)
 
 | # | Task | Status | Change | Tested by |
 |---|---|---|---|---|
 | M1 | AX messaging timeout on every tree walk | todo | | |
-| M2 | The activity tap is re-enabled after the system disables it | todo | | |
-| M3 | `pbcopy`/`pbpaste` run with a UTF-8 locale | todo | | |
+| M2 | The activity tap is re-enabled after the system disables it | done | `activity.rs` re-enables the tap on `kCGEventTapDisabledByTimeout` / `ByUserInput` | cargo check; live run in V3 |
+| M3 | `pbcopy`/`pbpaste` run with a UTF-8 locale | done | `input-handlers.ts` `utf8Env` on every `pbcopy`/`pbpaste`; doctor clipboard check | suite |
 | M4 | The agent pointer overlay is excluded from screen capture (macOS `sharingType`, Windows display affinity) | todo | | |
 | M5 | The capture helper honours `--region`; `wait_for_stable` reports `regionApplied: true` | todo | | |
 | M6 | macOS 27's "Device Control and Data Access" named beside "Accessibility" | todo | | |
@@ -64,12 +64,12 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 
 | # | Task | Status | Change | Tested by |
 |---|---|---|---|---|
-| K1 | Result contract at dispatch: `effect`, `route`, `delivery` on every action; `hint` and a safe `next_call` on every refusal and unverified result, from one table; `verify: true` on input tools; instructions describe it | todo | | |
-| K2 | `run_steps` in `desktop`: validate first, activate once, capped waits, stop at the first failure, optional final capture; click aliases listed only in `full` (still callable everywhere); OpenAI adapter scaling fixed | todo | | |
+| K1 | Result contract at dispatch: `effect`, `route`, `delivery` on every action; `hint` and a safe `next_call` on every refusal and unverified result, from one table; `verify: true` on input tools; instructions describe it | done | `session/contract.ts`: one refusal table (hint ≤ 240, read-only `next_call` callable in the profile); `applyContract` at dispatch; handlers report pid outcomes, activations, `set_value` and clipboard read-backs; `verify: true`; `element_not_found`; instructions and skill | v7.7-contract (8) |
+| K2 | `run_steps` in `desktop`: validate first, activate once, capped waits, stop at the first failure, optional final capture; click aliases listed only in `full` (still callable everywhere); OpenAI adapter scaling fixed | done | `run_steps` (registry-validated steps, focus once, stop at first failure, capture); aliases `listedFrom: full`, `tools/list` wrapped; `openai_computer` maps coordinates through the last screenshot | v7.7-run-steps (7); v6.2-modernization (alias callable in core) |
 | K3 | An unchanged capture returns text, not the image, with a streak cap | done | `screenshot-handlers.ts` `#unchangedReply`, `UNCHANGED_TEXT_REPEATS = 3`; `screenshot.resend` | session (dedup); session-screenshot-handlers (streak cap) |
-| K4 | Slow natives (accessibility walks, activation, captures) run off the event loop; the card is watched, not only polled; Stop latency under 50 ms, tested | todo | | |
-| K5 | A person's control by default: card on by default on macOS; emergency chord armed by default with modifier reconciliation; takeover on deliberate physical input; `screen_locked` and a display-awake assertion; Windows "locked" and "session disconnected" | todo | | |
-| K6 | Windows geometry and capture: per-monitor DPI v2 awareness and one coordinate contract; window capture `PrintWindow` → Windows.Graphics.Capture → crop with an occlusion flag → refusal for minimised; every output; HWND-precise restore | todo | | |
+| K4 | Slow natives (accessibility walks, activation, captures) run off the event loop; the card is watched, not only polled; Stop latency under 50 ms, tested | in progress | `operator-control.ts` watches `control.txt` (Stop under 50 ms); C6 hold. AsyncTask for slow natives next | v7.7-person-control (stop latency) |
+| K5 | A person's control by default: card on by default on macOS; emergency chord armed by default with modifier reconciliation; takeover on deliberate physical input; `screen_locked` and a display-awake assertion; Windows "locked" and "session disconnected" | in progress | card default on (macOS); chord armed by default with Windows modifier reconciliation; takeover counters and pause/resume; `screen_locked`, `session_disconnected`, `secure_desktop`; display awake; cards show takeover and the chord | v7.7-person-control (5) |
+| K6 | Windows geometry and capture: per-monitor DPI v2 awareness and one coordinate contract; window capture `PrintWindow` → Windows.Graphics.Capture → crop with an occlusion flag → refusal for minimised; every output; HWND-precise restore | in progress | `dpi.rs` per-monitor v2; `display.rs` physical coordinates, primary first; `windows.rs` visible bounds, cloaked; `capture_win.rs` ladder and every monitor; `screenshot-handlers.ts` exact mapping, `display_id` | cargo check (Windows); session-screenshot-handlers; hardware check pending |
 | K7 | Wayland foundations: portal and GNOME Shell screenshots; a window list that does not need `Shell.Eval`; backends named in `doctor`; a libei design note | todo | | |
 | K8 | macOS capture speed: ScreenCaptureKit display capture replaces `screencapture` + `sips`; `wait_for_text` polls with fast OCR and confirms with accurate; autorelease pools | todo | | |
 | K9 | Carried over: clipboard guard for non-text contents; `run_script` completes on exit plus a grace period; `scrape` refuses private hosts; filesystem search is async and cancellable | in progress | `spawn.ts` `EXIT_GRACE_MS` (done); clipboard guard, scrape, async search next | v7.7-spawn |
