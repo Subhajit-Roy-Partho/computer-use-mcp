@@ -136,11 +136,11 @@ prompts are normal setup requirements. Downloads is not guaranteed to bypass tho
 |---|---|
 | Discover applications | Find installed and running apps, identify their targets, and choose an automation approach. |
 | Read the interface | Capture a window, zoom into a region, inspect accessibility controls and find a button or field; read a window's text by on-device OCR when an app draws its own UI; wait for a window, for text, or for the screen to settle instead of polling screenshots. |
-| Operate applications | Click controls (`click` with button and count), fill forms, select menus, type text, drag paths and use keyboard shortcuts; set a session target once instead of naming the window on every call. |
+| Operate applications | Click controls (`click` with button and count), fill forms, select menus, type text, drag paths and use keyboard shortcuts; set a session target once instead of naming the window on every call; run a known sequence in one call (`run_steps`). Every action says whether it was verified, and every refusal names a safe next call. |
 | Use app scripting | AppleScript/JXA on macOS and PowerShell on Windows. |
 | Manage desktop work | Target individual windows, switch focus, read/write the clipboard and inspect displays. |
 | Build agent hosts | Add persistent desktop sessions, verified workflows, an MCP App console, isolated browser contexts and supervised runtimes. |
-| Stay in control | A desktop status card (`COMPUTER_USE_STATUS_CARD=true`, macOS and Windows) shows what the agent is doing with Pause and Stop; it never appears in the agent's screenshots. |
+| Stay in control | A desktop status card (on by default on macOS; `COMPUTER_USE_STATUS_CARD=true` on Windows) shows what the agent is doing with Pause and Stop, and `ctrl+alt+escape` stops it. Moving the mouse or typing pauses the agent until you stop. Neither the card nor the agent's pointer appears in its screenshots. |
 
 The default profile, **`desktop`**, exposes 37 tools on macOS: observation,
 coordinates, OCR for apps that draw their own UI, waits and the session target.
@@ -232,10 +232,11 @@ browser fixture. These live checks need their documented platform prerequisites.
 
 ## Documentation and support
 
+- [v7.7.0 release notes](docs/releases/v7.7.0.md): honest results, `run_steps`, a person in control by default, faster captures
 - [v7.6.1 release notes](docs/releases/v7.6.1.md): the review fixes and the desktop status card
 - [v7.6.0 release notes](docs/releases/v7.6.0.md) (includes 7.5.0: [its notes](docs/releases/v7.5.0.md))
 - [v7.4.0 release notes and rollout checklist](docs/releases/v7.4.0.md)
-- [Reviews](docs/reviews/): the 2026-10-09 review and design pass behind 7.6.0, and the 2026-10-11 three-pass review behind 7.6.1
+- [Reviews](docs/reviews/): the 2026-10-09 review and design pass behind 7.6.0, the 2026-10-11 three-pass review behind 7.6.1, and the 2026-10-23 competitor study behind 7.7.0
 - [Tool usage and agent setup](AGENTS.md)
 - [Architecture and platform support](docs/ARCHITECTURE.md)
 - [Sessions, Tasks, browser isolation and supervision](docs/STRATEGY.md)
