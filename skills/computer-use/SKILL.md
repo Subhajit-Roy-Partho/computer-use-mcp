@@ -41,7 +41,7 @@ A call that would activate an app or post keyboard/mouse input within `COMPUTER_
 - Use `delivery: "pid"` on `key`, `type`, `click`, `scroll`, `click_text`: events go to the target process with no activation and no cursor movement. Keys usually reach background apps; clicks often do not. `get_app_capabilities` says what has worked for that app
 - Otherwise `wait` and retry, or ask the user
 - **Never pass `force: true` unless the user asked for that action**
-- Only pid deliveries report a verification (`changed`, `no_visible_change`, `unverified`); every other action result says what was sent, not what happened: look (`read_window_text`, `wait_for_text`, `screenshot`) before building on it
+- Every action reply carries `effect`: `verified` (read back), `changed` / `no_visible_change` (captured before and after, by pid delivery or `verify: true`), or `unverified` (sent, not confirmed: look with `read_window_text`, `wait_for_text` or a region `screenshot` before building on it). Every refusal carries `hint` and `next_call`, a read-only call that is always safe to run as is
 - The guard needs Input Monitoring for the host app; if `doctor` says the clock is unavailable, the guard allows everything, so be careful yourself
 
 ## Safety

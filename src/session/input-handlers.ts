@@ -1,6 +1,7 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
 import type { AXBounds, NativeModule } from '../native.js'
 import { ok, okJson, type ToolResult } from '../result.js'
+import type { Effect } from './contract.js'
 import { StructuredToolError } from './errors.js'
 import type { FocusController } from './focus.js'
 import type { ResolvedTarget, TargetStateController } from './target-state.js'
@@ -29,6 +30,26 @@ const NON_PHYSICAL_TOOLS = new Set(['cursor_position', 'read_clipboard', 'write_
  * forgotten hold cannot keep keys down for long.
  */
 export const MAX_HOLD_SECONDS = 10
+
+/** 7.7.0 (K1): tools that accept `verify: true` (capture the target before and after, and report the effect). */
+export const VERIFIABLE_TOOLS = new Set([
+  'click', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'scroll', 'type', 'key',
+  'mouse_drag', 'left_click_drag', 'hold_key', 'multi_select', 'multi_edit',
+])
+
+/**
+ * 7.7.0 (M3): pbcopy and pbpaste pick their encoding from the locale; a host that starts the server without `LANG`
+ * (launchd, some IDEs) got non-ASCII text mangled. Run them with a UTF-8 locale unless one is set.
+ */
+export function utf8Env(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG
+  return locale && /utf-?8/i.test(locale) ? env : { ...env, LANG: 'en_US.UTF-8', LC_CTYPE: 'en_US.UTF-8' }
+}
+
+/** A pid delivery's verification outcome as a contract effect. */
+function pidEffect(outcome: PidOutcome | undefined): Effect {
+  return outcome === 'changed' ? 'changed' : outcome === 'no_visible_change' ? 'no_visible_change' : 'unverified'
+}
 
 /** v7.5 (R5): tools whose input can be posted to the target process instead. */
 export const PID_DELIVERY_TOOLS = new Set([
@@ -285,7 +306,8 @@ export class InputHandler {
         this.#native.mouseClickToPid!(chosen.pid, x, y, button, count, chosen.windowId)
       })
       if (resolved.bundleId) this.#targets.update(resolved, 'pointer')
-      return ok(`Clicked (${Math.round(x)}, ${Math.round(y)})${this.#pidNote(chosen, outcome)}`)
+      return { ...ok(`Clicked (${Math.round(x)}, ${Math.round(y)})${this.#pidNote(chosen, outcome)}`),
+        contract: { delivery: 'pid', effect: pidEffect(outcome) } }
     }
     await this.#focus.ensure(resolved, this.#focus.strategyFor(tool, args), { tool, force: true })
     const { x, y } = point
@@ -294,7 +316,32 @@ export class InputHandler {
     await this.#sleep(50)
     this.#native.mouseClick(x, y, button, count)
     this.#targets.trackClick(resolved)
-    return ok(`Clicked (${x}, ${y})`)
+    return { ...ok(`Clicked (${x}, ${y})`), contract: { delivery: 'hid' } }
+  }
+
+  /**
+   * 7.7.0 (K1) `verify: true`: capture the target (its window, or the screen) before and after the action and report
+   * `changed` or `no_visible_change` instead of `unverified`. It costs two captures and a 250 ms settle.
+   */
+  async #verified(args: Record<string, unknown>, act: () => Promise<ToolResult>): Promise<ToolResult> {
+    const before = await this.#targetHash(args)
+    const result = await act()
+    if (result.isError) return result
+    await this.#sleep(250)
+    const after = await this.#targetHash(args)
+    const effect: Effect = !before || !after ? 'unverified' : before === after ? 'no_visible_change' : 'changed'
+    return { ...result, contract: { ...result.contract, effect } }
+  }
+
+  async #targetHash(args: Record<string, unknown>): Promise<string | undefined> {
+    let windowId: number | undefined
+    try { windowId = this.#targets.resolve(args).windowId } catch { windowId = undefined }
+    try {
+      if (windowId !== undefined && this.#helper?.supportsCapture()) {
+        return (await this.#helper.capture({ windowId, width: 480, format: 'jpeg', quality: 60 })).hash
+      }
+      return this.#native.takeScreenshot(480, undefined, 60, undefined, windowId).hash
+    } catch { return undefined }
   }
 
   async handle(
@@ -303,6 +350,18 @@ export class InputHandler {
     signal?: AbortSignal,
   ): Promise<ToolResult | undefined> {
     if (!INPUT_TOOLS.has(tool)) return undefined
+    if (args.verify === true && VERIFIABLE_TOOLS.has(tool)) {
+      const { verify: _verify, ...rest } = args
+      return this.#verified(args, async () => (await this.#handle(tool, rest, signal))!)
+    }
+    return this.#handle(tool, args, signal)
+  }
+
+  async #handle(
+    tool: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<ToolResult | undefined> {
     const coordinate = (key = 'coordinate'): [number, number] => {
       const value = args[key]
       if (!Array.isArray(value) || value.length < 2
@@ -422,7 +481,7 @@ export class InputHandler {
         const deltaY = direction === 'up' ? -amount : direction === 'down' ? amount : 0
         const outcome = await this.#deliverPid(route, tool, () => this.#native.mouseScrollToPid!(route.pid, sx, sy, deltaY, deltaX, route.windowId))
         if (resolved.bundleId) this.#targets.update(resolved, 'pointer')
-        return ok(`Scrolled ${direction} ${amount}${this.#pidNote(route, outcome)}`)
+        return { ...ok(`Scrolled ${direction} ${amount}${this.#pidNote(route, outcome)}`), contract: { delivery: 'pid', effect: pidEffect(outcome) } }
       }
       this.#validateCoordinates(x, y)
       await focus(resolved)
@@ -488,7 +547,7 @@ export class InputHandler {
           try { this.#native.keyPressToPid!(route.pid, normalized, repeat) } catch (error) { throw explainNativeKeyError(error) }
         })
         if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
-        return ok(`Pressed ${args.text}${this.#pidNote(route, outcome)}`)
+        return { ...ok(`Pressed ${args.text}${this.#pidNote(route, outcome)}`), contract: { delivery: 'pid', effect: pidEffect(outcome) } }
       }
       await focus(resolved)
       try {
@@ -530,14 +589,21 @@ export class InputHandler {
 
     if (tool === 'read_clipboard') {
       if (this.#platform !== 'darwin' && this.#native.readClipboard) return ok(this.#native.readClipboard())
-      return ok(this.#execFile('pbpaste', []).toString())
+      return ok(this.#execFile('pbpaste', [], { env: utf8Env() }).toString())
     }
 
     if (tool === 'write_clipboard') {
       const text = string('text')
-      if (this.#platform !== 'darwin' && this.#native.writeClipboard) this.#native.writeClipboard(text)
-      else this.#execFile('pbcopy', [], { input: text })
-      return ok('Written')
+      let readBack: string | undefined
+      if (this.#platform !== 'darwin' && this.#native.writeClipboard) {
+        this.#native.writeClipboard(text)
+        try { readBack = this.#native.readClipboard?.() } catch { readBack = undefined }
+      } else {
+        this.#execFile('pbcopy', [], { input: text, env: utf8Env() })
+        try { readBack = this.#execFile('pbpaste', [], { env: utf8Env() }).toString() } catch { readBack = undefined }
+      }
+      // 7.7.0 (K1): read back, so `verified` means the clipboard holds exactly this text.
+      return { ...ok('Written'), contract: { effect: readBack === text ? 'verified' : 'unverified' } }
     }
 
     if (tool === 'mouse_drag') {
@@ -685,7 +751,7 @@ export class InputHandler {
       if (args.press_enter === true || args.press_enter === 'true') native.keyPressToPid!(route.pid, 'return')
     })
     if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
-    return ok(`${summary}${this.#pidNote(route, outcome)}`)
+    return { ...ok(`${summary}${this.#pidNote(route, outcome)}`), contract: { delivery: 'pid', effect: pidEffect(outcome) } }
   }
 
   /**
@@ -742,10 +808,10 @@ export class InputHandler {
       return
     }
     let saved: string | undefined
-    try { saved = this.#execFile('pbpaste', []).toString() } catch { /* best effort */ }
+    try { saved = this.#execFile('pbpaste', [], { env: utf8Env() }).toString() } catch { /* best effort */ }
     try {
-      this.#execFile('pbcopy', [], { input: text })
-      const verified = this.#execFile('pbpaste', []).toString()
+      this.#execFile('pbcopy', [], { input: text, env: utf8Env() })
+      const verified = this.#execFile('pbpaste', [], { env: utf8Env() }).toString()
       if (verified === text) {
         this.#native.keyPress('command+v')
         await this.#sleep(100)
@@ -753,7 +819,7 @@ export class InputHandler {
     } finally {
       if (typeof saved === 'string') {
         try {
-          if (this.#execFile('pbpaste', []).toString() === text) this.#execFile('pbcopy', [], { input: saved })
+          if (this.#execFile('pbpaste', [], { env: utf8Env() }).toString() === text) this.#execFile('pbcopy', [], { input: saved, env: utf8Env() })
         } catch { /* best effort */ }
       }
     }

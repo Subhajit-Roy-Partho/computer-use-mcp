@@ -531,6 +531,13 @@ requires_approval = false
 credential_bindings = []
 
 [[tools]]
+name = "run_steps"
+description = "Run several actions in one call: every step checked first, the target focused once, stopping at the first failure"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
 name = "set_target"
 description = "Set the session target window for input and capture tools"
 risk_class = "read_only"

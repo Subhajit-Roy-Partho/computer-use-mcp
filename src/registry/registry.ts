@@ -21,6 +21,7 @@ import {
   toMcpAnnotations,
   toolAvailableOn,
   toolInProfile,
+  toolListedInProfile,
   type ProfileName,
   type ToolMeta,
 } from '../tool-catalog.js'
@@ -301,6 +302,36 @@ export class ToolRegistry {
     }
   }
 
+  /**
+   * 7.7.0 (K2): the checks a direct call gets, for a call that does not arrive over MCP (a run_steps step): unknown
+   * arguments refused by name with the nearest declared one, then the schema applied with its defaults.
+   */
+  validateArguments(tool: string, args: Record<string, unknown>):
+    | { ok: true; args: Record<string, unknown> }
+    | { ok: false; issues: Array<{ path: string; message: string }> } {
+    const definition = this.#definitions.get(tool)
+    if (!definition) return { ok: false, issues: [{ path: '(tool)', message: `unknown tool ${tool}` }] }
+    const accepted = new Set([...Object.keys(definition.inputSchema), 'approval_token', ...(definition.undeclaredArgs ?? [])])
+    const unknownKeys = Object.keys(args ?? {}).filter(key => !accepted.has(key))
+    if (unknownKeys.length > 0) {
+      return {
+        ok: false,
+        issues: unknownKeys.map(key => {
+          const nearest = nearestArgumentName(key, accepted)
+          return { path: key, message: `unknown argument${nearest ? `; did you mean "${nearest}"?` : ''}` }
+        }),
+      }
+    }
+    const validated = z.object(definition.inputSchema).passthrough().safeParse(args ?? {})
+    if (!validated.success) {
+      return {
+        ok: false,
+        issues: validated.error.issues.map(issue => ({ path: issue.path.join('.') || '(root)', message: issue.message })),
+      }
+    }
+    return { ok: true, args: validated.data as Record<string, unknown> }
+  }
+
   registerAll(server: McpServer): void {
     this.assertComplete()
 
@@ -566,6 +597,36 @@ export class ToolRegistry {
       this.#registeredTools.set(definition.name, registered)
       if (!this.#inActiveSurface(definition, this.#activeProfile)) registered.disable()
     }
+    this.#listOnlyListedTools(server)
+  }
+
+  /**
+   * 7.7.0 (K2): tools/list leaves out a tool its catalog entry lists only from a later profile (the click aliases,
+   * listed in `full`), while the tool stays registered and callable. The SDK lists every enabled tool, so its handler
+   * is wrapped through the protocol's own handler accessors; a test pins this against the pinned SDK version.
+   */
+  #listOnlyListedTools(server: McpServer): void {
+    type ListHandler = (request: unknown, context: unknown) => Promise<{ tools: Array<{ name: string }> } & Record<string, unknown>>
+    const protocol = (server as unknown as {
+      server: {
+        _getRequestHandler?(method: string): ListHandler | undefined
+        removeRequestHandler?(method: string): void
+        setRequestHandler(method: string, handler: ListHandler): void
+      }
+    }).server
+    const original = protocol._getRequestHandler?.('tools/list')
+    if (!original || typeof protocol.removeRequestHandler !== 'function') return
+    protocol.removeRequestHandler('tools/list')
+    protocol.setRequestHandler('tools/list', async (request, context) => {
+      const result = await original(request, context)
+      return {
+        ...result,
+        tools: result.tools.filter(tool => {
+          const meta = this.#registeredMeta.get(tool.name)
+          return !meta || toolListedInProfile(meta, this.#activeProfile)
+        }),
+      }
+    })
   }
 
   #withinMaximum(definition: ToolDefinition): boolean {

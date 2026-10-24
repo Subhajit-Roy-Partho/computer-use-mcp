@@ -1,6 +1,7 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
 import type { NativeModule } from '../native.js'
 import type { SpawnBounded, SpawnResult } from './spawn.js'
+import { utf8Env } from './input-handlers.js'
 import type { LegacyPolicyConfig } from './legacy-policy.js'
 
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip'
@@ -121,7 +122,7 @@ export async function runDoctor(options: {
     try {
       saved = isWindows && options.native.readClipboard
         ? options.native.readClipboard()
-        : executeFile('pbpaste', []).toString()
+        : executeFile('pbpaste', [], { env: utf8Env() }).toString()
     } catch { /* clipboard may be empty */ }
     let roundTrip: string
     if (isWindows && options.native.writeClipboard && options.native.readClipboard) {
@@ -129,9 +130,9 @@ export async function runDoctor(options: {
       roundTrip = options.native.readClipboard()
       if (saved) options.native.writeClipboard(saved)
     } else {
-      executeFile('pbcopy', [], { input: marker })
-      roundTrip = executeFile('pbpaste', []).toString()
-      executeFile('pbcopy', [], { input: saved })
+      executeFile('pbcopy', [], { input: marker, env: utf8Env() })
+      roundTrip = executeFile('pbpaste', [], { env: utf8Env() }).toString()
+      executeFile('pbcopy', [], { input: saved, env: utf8Env() })
     }
     add({
       id: 'clipboard', status: roundTrip === marker ? 'pass' : 'fail',

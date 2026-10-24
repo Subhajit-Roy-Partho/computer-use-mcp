@@ -182,6 +182,8 @@ export interface NativeModule {
     reason?: string
   }
   getEmergencyStopGeneration?(): number
+  /** 7.7.0 (K5): physical input since the monitor started (pointer travel, key presses, button presses). */
+  getPhysicalInputCounters?(): { supported: boolean; movement: number; keys: number; buttons: number }
   isNativeEmergencyStopActive?(): boolean
   triggerNativeEmergencyStop?(): void
   /** Host-only reset. This is intentionally never exposed as an MCP tool. */
@@ -256,14 +258,32 @@ export interface NativeModule {
   getDisplaySize(displayId?: number): { x?: number; y?: number; width: number; height: number; pixelWidth: number; pixelHeight: number; scaleFactor: number; displayId: number }
   listDisplays(): Array<{ x?: number; y?: number; width: number; height: number; scaleFactor: number; displayId: number }>
   // Screenshot
-  takeScreenshot(width?: number, targetApp?: string, quality?: number, previousHash?: string, windowId?: number): {
+  takeScreenshot(width?: number, targetApp?: string, quality?: number, previousHash?: string, windowId?: number, displayId?: number): {
     base64?: string
     width: number
     height: number
     mimeType: string
     hash: string
     unchanged: boolean
+    /**
+     * 7.7.0 (Windows): how the image was captured (`print_window`, `graphics_capture`, `screen_crop`, `bitblt` for a
+     * window; `screen` for a display), whether a screen crop was partly covered, and the screen rectangle the image
+     * shows, in the same coordinates input uses.
+     */
+    capture?: { method: string; occluded: boolean; x: number; y: number; width: number; height: number }
   }
+
+  // ── 7.7.0 (K5): is the desktop usable, and keep it awake while an agent works ──
+  getSessionState?(): {
+    locked: boolean | null
+    disconnected: boolean
+    secureDesktop: boolean
+    offConsole: boolean
+    backend: string
+    detail?: string | null
+  }
+  holdDisplayAwake?(reason: string): boolean
+  releaseDisplayAwake?(): void
 
   // ── v5: Accessibility ──────────────────────────────────────────────────
   /** Depth-limited AX tree rooted at the window; caps at 500 nodes. */

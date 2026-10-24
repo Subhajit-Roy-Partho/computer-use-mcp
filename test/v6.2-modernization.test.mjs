@@ -36,7 +36,7 @@ function createMockNative() {
 test('catalog has 79 tools and MUTATING_TOOLS matches mutates flag', () => {
   const names = Object.keys(TOOL_CATALOG)
   // 73 in v7.5; v7.6 added click, set_target, get_target, wait_for_text and wait_for_stable
-  assert.equal(names.length, 79, `expected 79 tools (7.6.1 added control_status), got ${names.length}`)
+  assert.equal(names.length, 80, `expected 80 tools (7.7.0 added run_steps), got ${names.length}`)
   for (const [name, meta] of Object.entries(TOOL_CATALOG)) {
     assert.equal(MUTATING_TOOLS.has(name), meta.mutates, `${name}: MUTATING_TOOLS vs mutates mismatch`)
   }
@@ -101,7 +101,12 @@ test('profile=core hides ax-only tools', async () => {
     const tools = await client.listTools()
     const names = new Set(tools.map(t => t.name))
     assert.ok(names.has('screenshot'))
-    assert.ok(names.has('left_click'))
+    assert.ok(names.has('click'))
+    // 7.7.0 (K2): the click aliases are listed only in full, and still callable everywhere.
+    assert.ok(!names.has('left_click'), 'left_click is listed only in full')
+    const aliased = await client.callTool('left_click', { coordinate: [10, 10], force: true })
+    assert.notEqual(aliased.content.find(c => c.type === 'text')?.text ?? '', '', 'left_click is still callable in core')
+    assert.ok(!/not found|disabled/i.test(JSON.stringify(aliased)), 'the SDK did not refuse the alias')
     assert.ok(!names.has('get_ui_tree'), 'get_ui_tree is ax-only')
     assert.ok(!names.has('run_script'), 'run_script is scripting-only')
     assert.ok(!names.has('process_kill'), 'process_kill is windows-admin-only')

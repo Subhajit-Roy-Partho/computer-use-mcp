@@ -204,3 +204,31 @@ test('a helper failure that is not a cancellation still falls back to the native
   assert.equal(result.content[0].type, 'image')
   assert.equal(handler.helperFailure(), 'sck_timeout: stalled')
 })
+
+// ── 7.7.0 (K6): a Windows capture states its exact rectangle and how it was taken ───────────────────────────
+test('a capture that reports its rectangle is described exactly, with its method and any occlusion', () => {
+  for (const [capture, phrase] of [
+    [{ method: 'print_window', occluded: false, x: 100, y: 50, width: 800, height: 600 }, /PrintWindow\), so it is complete even when covered/],
+    [{ method: 'screen_crop', occluded: true, x: -1900, y: 10, width: 800, height: 600 }, /part of the window was covered/],
+  ]) {
+    const f = fixture({
+      takeScreenshot: (...args) => {
+        f.native.calls.push(['screenshot', ...args])
+        return { base64: 'raw', width: 400, height: 300, mimeType: 'image/png', hash: `h-${capture.method}`, capture }
+      },
+    })
+    const result = f.handler.handle('screenshot', { target_window_id: 42 })
+    const text = result.content[1].text
+    assert.match(text, new RegExp(`window 42 at ${capture.x},${capture.y} sized 800x600`))
+    assert.match(text, new RegExp(`screen_x = ${capture.x} \\+ image_x \\* 2\\.0000`))
+    assert.match(text, phrase)
+  }
+})
+
+test('display_id reaches the native capture for a full-screen screenshot only', () => {
+  const f = fixture()
+  f.handler.handle('screenshot', { full_screen: true, display_id: 65537 })
+  assert.equal(f.native.calls[0][6], 65537)
+  f.handler.handle('screenshot', { target_window_id: 42, display_id: 65537 })
+  assert.equal(f.native.calls[1][6], undefined, 'a window capture ignores display_id')
+})

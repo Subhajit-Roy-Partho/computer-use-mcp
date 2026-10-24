@@ -98,14 +98,20 @@ export async function handleWindowTool(
       else if (running.isHidden) { reason = 'hidden'; suggestedRecovery = 'unhide_app' }
       else reason = 'timeout'
     }
-    return ok(JSON.stringify({
+    const payload = {
       requestedBundleId: bundleId,
       frontmostBefore: frontmostBefore?.bundleId ?? null,
       frontmostAfter: frontmostAfter?.bundleId ?? null,
       activated,
       reason,
       ...(suggestedRecovery ? { suggestedRecovery } : {}),
-    }))
+    }
+    // 7.7.0 (K1): an activation confirmed by the frontmost app is verified; one that did not happen says so.
+    return { ...okJson(payload), contract: activated ? { effect: 'verified' } : {
+      effect: 'no_visible_change',
+      hint: suggestedRecovery === 'unhide_app' ? 'The app is hidden: unhide_app, then activate it again.'
+        : reason === 'not_running' ? 'The app is not running: open_application starts it.' : 'The app did not come to the front; check what is in front, then retry.',
+    } }
   }
 
   if (tool === 'activate_window') {
@@ -139,7 +145,7 @@ export async function handleWindowTool(
       frontmostAfter: native.getFrontmostApp()?.bundleId ?? null,
       reason: result.reason,
     }
-    return result.activated ? okJson(payload) : errJson({ error: 'activation_failed', ...payload })
+    return result.activated ? { ...okJson(payload), contract: { effect: 'verified' } } : errJson({ error: 'activation_failed', ...payload })
   }
 
   if (tool === 'open_application') {
@@ -160,7 +166,7 @@ export async function handleWindowTool(
           : 'Use activate_app for diagnostics, unhide_app if it is hidden, or wait_for_window for its window.'],
       })
     }
-    return ok(`Opened ${bundleId} (activated: true)`)
+    return { ...ok(`Opened ${bundleId} (activated: true)`), contract: { effect: 'verified' } }
   }
   if (tool === 'get_frontmost_app') return okJson({ app: native.getFrontmostApp() ?? null })
   if (tool === 'list_windows') {

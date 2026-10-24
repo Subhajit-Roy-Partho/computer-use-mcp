@@ -1,6 +1,7 @@
 import type { ToolResult } from '../result.js'
 import type { SessionRequestContext } from '../session.js'
 import { mapLegacyOpenAiAction } from './openai-compat.js'
+import type { ScreenMapping } from './screenshot-handlers.js'
 
 export type CompatibilityDispatch = (
   tool: string,
@@ -13,8 +14,32 @@ export type CompatibilityDispatch = (
 /** Executes the legacy OpenAI computer-action envelope through canonical tools. */
 export class OpenAiCompatibilityHandler {
   readonly #dispatch: CompatibilityDispatch
+  readonly #mapping: () => ScreenMapping | undefined
 
-  constructor(dispatch: CompatibilityDispatch) { this.#dispatch = dispatch }
+  /**
+   * `mapping` is the last screenshot's image-to-screen mapping. 7.7.0 (K2): OpenAI's computer actions carry
+   * coordinates in the pixel space of the screenshot the model saw; they were passed to input unscaled, so on any
+   * capture narrower than the screen every click landed short. They are mapped through the last screenshot unless
+   * the call says `coordinate_space: "screen"`.
+   */
+  constructor(dispatch: CompatibilityDispatch, mapping: () => ScreenMapping | undefined = () => undefined) {
+    this.#dispatch = dispatch
+    this.#mapping = mapping
+  }
+
+  #toScreen(args: Record<string, unknown>): Record<string, unknown> {
+    const mapping = this.#mapping()
+    if (!mapping) return args
+    const point = (value: unknown): unknown => Array.isArray(value) && value.length >= 2
+      && typeof value[0] === 'number' && typeof value[1] === 'number'
+      ? [Math.round(mapping.originX + value[0] * mapping.scaleX), Math.round(mapping.originY + value[1] * mapping.scaleY)]
+      : value
+    const mapped = { ...args }
+    if ('coordinate' in mapped) mapped.coordinate = point(mapped.coordinate)
+    if ('start_coordinate' in mapped) mapped.start_coordinate = point(mapped.start_coordinate)
+    if (Array.isArray(mapped.path)) mapped.path = mapped.path.map(point)
+    return mapped
+  }
 
   async handle(
     tool: string,
@@ -59,7 +84,8 @@ export class OpenAiCompatibilityHandler {
       try {
         signal?.throwIfAborted()
         actionType = mapped.actionType
-        const result = await this.#dispatch(mapped.tool, mapped.args, signal, onProgress, requestContext)
+        const actionArgs = args.coordinate_space === 'screen' ? mapped.args : this.#toScreen(mapped.args)
+        const result = await this.#dispatch(mapped.tool, actionArgs, signal, onProgress, requestContext)
         summaries.push({ index, action: actionType, tool: mapped.tool, ok: !result.isError })
         content.push(...result.content)
         if (result.isError) {

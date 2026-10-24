@@ -2,7 +2,14 @@
  * Tool result helpers — dual-write text JSON + structuredContent (K5 / K21).
  */
 
+import type { ActionContract } from './session/contract.js'
+
 export interface ToolResult {
+  /**
+   * 7.7.0 (K1): what the handler knows about the action's effect (pid verification, an activation it confirmed, a
+   * value it read back). Internal: the session merges it into the reply's contract and never sends this field.
+   */
+  contract?: Partial<ActionContract>
   content: Array<
     | { type: 'text'; text: string }
     | { type: 'image'; data: string; mimeType: string }

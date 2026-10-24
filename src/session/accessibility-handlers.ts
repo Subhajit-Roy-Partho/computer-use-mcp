@@ -150,8 +150,11 @@ function similarLabels(
     .sort((left, right) => left.distance - right.distance)
     .slice(0, 5)
     .map(({ element }) => ({ role: element.role, label: element.label, value: element.value }))
+  // 7.7.0 (K1): a code the contract table knows, the sentence as the message, and the labels AGENTS.md documents.
+  const payload = { error: 'element_not_found', message, similar, similarLabels: similar.map(entry => entry.label) }
   return {
-    content: [{ type: 'text', text: JSON.stringify({ error: message, similar }) }],
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    structuredContent: payload,
     isError: true,
   }
 }
@@ -235,7 +238,16 @@ export async function handleAccessibilityTool(
       const result = native.setElementValue(target.windowId, role, label, value)
       if (result.set) {
         context.targets.update(target, 'keyboard')
-        return ok(`Set ${role} "${label}"`)
+        // 7.7.0 (K1): read the value back. A protected field's value is never read (null), so it stays unverified.
+        let readBack: string | null | undefined
+        try { readBack = native.findElement(target.windowId, role, label, undefined, 1)[0]?.value } catch { readBack = undefined }
+        const effect = readBack === value ? 'verified' as const : 'unverified' as const
+        return { ...ok(`Set ${role} "${label}"`), contract: effect === 'verified' ? { effect } : {
+          effect,
+          hint: readBack === null
+            ? 'The field accepted the value; it is protected, so its value is never read back. Check the form before submitting.'
+            : `The field accepted the value but reads back ${readBack === undefined ? 'nothing' : JSON.stringify(String(readBack).slice(0, 60))}. Check it before submitting.`,
+        } }
       }
       if (result.reason === 'read_only') {
         return { content: [{ type: 'text', text: `Element ${role} "${label}" is read-only` }], isError: true }

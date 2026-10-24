@@ -27,6 +27,11 @@ export interface ToolMeta {
   job: ToolJob
   /** v7.6 R7: platforms the tool exists on; undefined = every platform. A tool not for the running platform is neither listed nor callable. */
   platforms?: readonly NodeJS.Platform[]
+  /**
+   * 7.7.0 (K2): the profile from which the tool is listed, when that is later than where it is callable. The click
+   * aliases are callable in every profile (7.6 promised it) but listed only in `full`, which pays for run_steps.
+   */
+  listedFrom?: ProfileName
 }
 
 export interface McpToolAnnotations {
@@ -79,6 +84,12 @@ export function toolInProfile(meta: ToolMeta, profile: ProfileName): boolean {
   return profilesForTier(meta.tier).includes(profile)
 }
 
+/** Whether a profile lists the tool in tools/list (7.7.0): callable there, and not held back to a later profile. */
+export function toolListedInProfile(meta: ToolMeta, profile: ProfileName): boolean {
+  if (!toolInProfile(meta, profile)) return false
+  return !meta.listedFrom || profile === 'full' || profilesForTier(meta.listedFrom).includes(profile)
+}
+
 /** The default profile is `desktop` since v7.6 (core plus the OCR and wait tools); `full` lists everything. */
 export const DEFAULT_PROFILE: ProfileName = 'desktop'
 
@@ -129,7 +140,7 @@ const NONE_READ = (tier: ProfileName = 'core', extra?: Partial<ToolMeta>): ToolM
 const NONE_MUT = (tier: ProfileName = 'core', extra?: Partial<ToolMeta>): ToolMeta =>
   m('none', true, { requiresFocus: false, tier, ...extra })
 
-/** Appendix A + B — every tool (73 in v7.5; 78 in v7.6 with click, set_target, get_target, wait_for_text, wait_for_stable; 79 in 7.6.1 with control_status) */
+/** Appendix A + B — every tool (73 in v7.5; 78 in v7.6 with click, set_target, get_target, wait_for_text, wait_for_stable; 79 in 7.6.1 with control_status; 80 in 7.7.0 with run_steps) */
 export const TOOL_CATALOG: Record<string, ToolMeta> = {
   doctor: NONE_READ('core'),
   policy_status: NONE_READ('core'),
@@ -140,13 +151,16 @@ export const TOOL_CATALOG: Record<string, ToolMeta> = {
   }),
   screenshot: NONE_READ('core'),
   zoom: NONE_READ('core'),
-  // v7.6 R7: one click; the five variants stay as thin aliases (tiny schemas) so existing agents keep working
+  // v7.6 R7: one click; the five variants stay as thin aliases so existing agents keep working. 7.7.0: still callable
+  // in every profile, listed only in `full`.
   click: CG_MUT('core'),
-  left_click: CG_MUT('core'),
-  right_click: CG_MUT('core'),
-  middle_click: CG_MUT('core'),
-  double_click: CG_MUT('core'),
-  triple_click: CG_MUT('core'),
+  left_click: { ...CG_MUT('core'), listedFrom: 'full' },
+  right_click: { ...CG_MUT('core'), listedFrom: 'full' },
+  middle_click: { ...CG_MUT('core'), listedFrom: 'full' },
+  double_click: { ...CG_MUT('core'), listedFrom: 'full' },
+  triple_click: { ...CG_MUT('core'), listedFrom: 'full' },
+  // 7.7.0 (K2): several actions in one call, validated first, stopped at the first failure.
+  run_steps: CG_MUT('desktop'),
   mouse_move: CG_MUT('core'),
   left_click_drag: CG_MUT('ax'),
   mouse_drag: CG_MUT('ax'),
@@ -225,7 +239,7 @@ const TOOL_JOBS: Record<ToolJob, readonly string[]> = {
   meta: ['doctor', 'policy_status', 'get_tool_guide', 'get_tool_metadata', 'get_app_capabilities', 'discover_applications', 'set_target', 'get_target', 'control_status'],
   observe: ['screenshot', 'zoom', 'snapshot', 'read_window_text', 'list_windows', 'get_window', 'get_cursor_window', 'get_frontmost_app',
     'list_running_apps', 'get_display_size', 'list_displays', 'cursor_position', 'read_clipboard', 'wait', 'wait_for_window', 'wait_for_text', 'wait_for_stable'],
-  act: ['click', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'click_text', 'mouse_move', 'left_click_drag', 'mouse_drag',
+  act: ['click', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'run_steps', 'click_text', 'mouse_move', 'left_click_drag', 'mouse_drag',
     'left_mouse_down', 'left_mouse_up', 'scroll', 'type', 'key', 'hold_key', 'write_clipboard', 'agent_pointer', 'openai_computer', 'multi_select', 'multi_edit',
     'open_application', 'hide_app', 'unhide_app', 'activate_app', 'activate_window', 'resize_window'],
   semantic: ['get_ui_tree', 'get_focused_element', 'find_element', 'click_element', 'set_value', 'press_button', 'select_menu_item', 'fill_form', 'list_menu_bar'],
@@ -266,6 +280,18 @@ for (const [name, platforms] of Object.entries(TOOL_PLATFORMS)) {
   const missing = Object.keys(TOOL_CATALOG).filter(name => !jobbed.has(name))
   if (missing.length) throw new Error(`tools without a job: ${missing.join(', ')}`)
 }
+
+/**
+ * 7.7.0 (K2): what a run_steps step may be: input, accessibility actions, activation, the clipboard and the waits. Not
+ * scripts, admin tools or another batch: those keep their own call, with their own approval.
+ */
+export const RUN_STEP_TOOLS = [
+  'click', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click',
+  'type', 'key', 'hold_key', 'scroll', 'mouse_move', 'mouse_drag', 'left_click_drag', 'click_text',
+  'click_element', 'set_value', 'press_button', 'select_menu_item', 'fill_form',
+  'activate_app', 'activate_window', 'write_clipboard',
+  'wait', 'wait_for_window', 'wait_for_text', 'wait_for_stable',
+] as const
 
 /** Tools that acquire the session lock (derived from catalog mutates flag). */
 export const MUTATING_TOOLS = new Set(

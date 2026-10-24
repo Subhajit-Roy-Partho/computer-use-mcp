@@ -11,7 +11,8 @@ import { withToolDefaults } from './registry/definitions.js'
 import { discoverApplications } from './session/application-discovery.js'
 import { okJson } from './result.js'
 import { loadNative, type NativeModule } from './native.js'
-import { DEFAULT_PROFILE, MUTATING_TOOLS, getToolMeta } from './tool-catalog.js'
+import { DEFAULT_PROFILE, MUTATING_TOOLS, RUN_STEP_TOOLS, getToolMeta, parseProfile, toolAvailableOn, toolInProfile } from './tool-catalog.js'
+import { applyContract, withRefusalAdvice, type Effect } from './session/contract.js'
 import { sleep, sleepAbortable, defaultSpawnBounded } from './session/spawn.js'
 import type { SpawnBounded } from './session/spawn.js'
 import { FocusError, StructuredToolError, WindowNotFoundError } from './session/errors.js'
@@ -42,7 +43,7 @@ import { handleAgentDesktopTool } from './session/agent-desktop-handlers.js'
 import { createMacosHelper, type MacosHelper } from './session/macos-helper.js'
 import { defaultPidDeliveryPath, PidDeliveryStore } from './session/pid-delivery.js'
 import { createUserActivityGuard, type UserActivityGuard } from './session/user-activity.js'
-import { OperatorControl, defaultCardPresenter, describeAction, statusCardEnabled } from './session/operator-control.js'
+import { OperatorControl, defaultCardPresenter, describeAction, emergencyChord, statusCardEnabled, takeoverEnabled } from './session/operator-control.js'
 import {
   errJson,
   type ToolResult,
@@ -166,9 +167,18 @@ export interface SessionOptions {
    * Tests inject one with a fake presenter.
    */
   operatorControl?: OperatorControl
+  /**
+   * 7.7.0 (K2): the registry's argument check, so each run_steps step is validated exactly like a direct call. Absent
+   * (a session without a registry, as in tests): steps are checked by tool name and availability only.
+   */
+  validateArguments?: (tool: string, args: Record<string, unknown>) =>
+    | { ok: true; args: Record<string, unknown> }
+    | { ok: false; issues: Array<{ path: string; message: string }> }
 }
 
 const IS_WINDOWS = process.platform === 'win32'
+/** 7.7.0 (K5): tools that capture the screen, refused with the mutating ones while the screen is locked. */
+const CAPTURE_TOOLS = new Set(['screenshot', 'zoom', 'snapshot', 'read_window_text', 'click_text', 'wait_for_text', 'wait_for_stable'])
 
 // MUTATING_TOOLS imported from tool-catalog.ts (SSOT with ToolMeta.mutates; includes resize_window).
 // Observation tools (screenshot, list_*, get_*) do not take the lock.
@@ -215,6 +225,8 @@ export function createSession(opts: SessionOptions = {}): Session {
       // 7.6.1: apps hidden by prepare_display that the agent never restored come back when the session ends.
       try { focus.restoreHidden() } catch { /* best effort */ }
       try { control.close() } catch { /* the card is optional */ }
+      if (awakeTimer) clearTimeout(awakeTimer)
+      try { n.releaseDisplayAwake?.() } catch { /* best effort */ }
     }
   }
   const defaultProvider = opts.provider ?? process.env.COMPUTER_USE_PROVIDER ?? 'auto'
@@ -224,9 +236,55 @@ export function createSession(opts: SessionOptions = {}): Session {
     : opts.macosHelper ?? (process.platform === 'darwin' && opts.native == null ? createMacosHelper() : undefined)
   const pidStore = opts.pidDeliveryStore ?? new PidDeliveryStore(opts.native == null ? defaultPidDeliveryPath() : undefined)
   const userGuard = opts.userActivityGuard ?? createUserActivityGuard({ native: n })
-  // 7.6.1: the person's pause/stop state and the desktop status card.
+  // 7.6.1: the person's pause/stop state and the desktop status card. 7.7.0 (K5): the card is on by default on macOS,
+  // the emergency chord is armed by default (macOS and Windows), and a person taking over the mouse or keyboard
+  // during an action pauses the agent until they stop.
   const cardPresenter = opts.native == null && statusCardEnabled() ? defaultCardPresenter() : undefined
-  const control = opts.operatorControl ?? new OperatorControl({ native: n, ...(cardPresenter ? { card: { presenter: cardPresenter } } : {}) })
+  let armedChord: string | null = null
+  const wantedChord = opts.native == null ? emergencyChord() : null
+  if (wantedChord && n.configureEmergencyStopChord) {
+    try { armedChord = n.configureEmergencyStopChord(wantedChord)?.supported ? wantedChord : null } catch { armedChord = null }
+  }
+  const control = opts.operatorControl ?? new OperatorControl({
+    native: n,
+    chord: armedChord,
+    ...(cardPresenter ? { card: { presenter: cardPresenter } } : {}),
+    ...(takeoverEnabled() && typeof n.getPhysicalInputCounters === 'function' ? {
+      takeover: {
+        counters: () => { try { return n.getPhysicalInputCounters?.() } catch { return undefined } },
+        idleMs: () => { try { return n.getUserIdleTimeMs?.() ?? null } catch { return null } },
+      },
+    } : {}),
+  })
+  // 7.7.0 (K5): keep the display awake while an agent works, released after ten quiet minutes or on close.
+  const AWAKE_RELEASE_MS = 10 * 60_000
+  let awakeTimer: ReturnType<typeof setTimeout> | undefined
+  const keepAwake = () => {
+    if (process.env.COMPUTER_USE_KEEP_AWAKE === 'false' || typeof n.holdDisplayAwake !== 'function') return
+    try { n.holdDisplayAwake('computer-use-mcp: an agent is using this computer') } catch { return }
+    if (awakeTimer) clearTimeout(awakeTimer)
+    awakeTimer = setTimeout(() => { try { n.releaseDisplayAwake?.() } catch { /* best effort */ } }, AWAKE_RELEASE_MS)
+    awakeTimer.unref?.()
+  }
+  // 7.7.0 (K5): a locked screen, a disconnected Remote Desktop session or the secure desktop takes no input and
+  // shows nothing worth capturing; read the session state at most once a second.
+  let sessionState: { at: number; refusal: Record<string, unknown> | undefined } | undefined
+  const sessionRefusal = (tool: string): Record<string, unknown> | undefined => {
+    if (typeof n.getSessionState !== 'function') return undefined
+    const now = Date.now()
+    if (!sessionState || now - sessionState.at > 1000) {
+      let refusal: Record<string, unknown> | undefined
+      try {
+        const state = n.getSessionState()
+        if (state.disconnected) refusal = { error: 'session_disconnected', message: 'The Remote Desktop session is disconnected.' }
+        else if (state.locked === true) refusal = { error: 'screen_locked', message: 'The screen is locked.' }
+        else if (state.offConsole) refusal = { error: 'screen_locked', message: 'Another user has the console (fast user switching).' }
+        else if (state.secureDesktop) refusal = { error: 'secure_desktop', message: 'A UAC prompt or the sign-in screen has the input.' }
+      } catch { refusal = undefined }
+      sessionState = { at: now, refusal }
+    }
+    return sessionState.refusal ? { ...sessionState.refusal, tool } : undefined
+  }
   // Start the native input monitor now: it counts its own start as input, so a
   // first reading taken at the first tool call would refuse that call.
   userGuard.activity()
@@ -273,6 +331,7 @@ export function createSession(opts: SessionOptions = {}): Session {
   const getPowerShellExe = scripting.getPowerShellExe.bind(scripting)
   const openAiHandler = new OpenAiCompatibilityHandler(
     (tool, args, signal, onProgress, requestContext) => dispatch(tool, args, signal, onProgress, requestContext),
+    () => screenshotHandler.lastMapping(),
   )
   const focusFailureText = (details: FocusFailure): string => JSON.stringify(details)
 
@@ -316,7 +375,27 @@ export function createSession(opts: SessionOptions = {}): Session {
 
   // ── Dispatch ────────────────────────────────────────────────────────────
 
+  /** 7.7.0 (K1): a suggested next_call must be a tool this session can call (its profile and platform). */
+  const profileName = parseProfile(activeProfile)
+  const callable = (name: string): boolean => {
+    const meta = getToolMeta(name)
+    return Boolean(meta && toolInProfile(meta, profileName) && toolAvailableOn(meta, process.platform))
+  }
+
+  /** Every reply through the result contract: effect, route and delivery on actions; hint and next_call on refusals. */
   async function dispatch(
+    tool: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+    onProgress?: ProgressReporter,
+    requestContext?: SessionRequestContext,
+  ): Promise<ToolResult> {
+    const result = await dispatchRaw(tool, args, signal, onProgress, requestContext)
+    if (requestContext?.preflight) return result
+    return applyContract(tool, withToolDefaults(tool, args), result, process.platform, callable)
+  }
+
+  async function dispatchRaw(
     tool: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
@@ -426,6 +505,7 @@ export function createSession(opts: SessionOptions = {}): Session {
     let result: ToolResult
     try {
       result = await (async (): Promise<ToolResult> => {
+      if (tool === 'run_steps') return runSteps(args, signal, requestContext)
       const clientRoots = requestContext?.clientRoots ?? opts.getClientRoots?.()
       const extracted = await handleAdminTool(tool, args, {
         spawnBounded,
@@ -562,6 +642,129 @@ export function createSession(opts: SessionOptions = {}): Session {
     return result
   }
 
+  // ── run_steps (7.7.0, K2) ─────────────────────────────────────────────────
+
+  const STEP_TOOLS = new Set<string>(RUN_STEP_TOOLS)
+  const EFFECT_RANK: Record<Effect, number> = { no_visible_change: 0, unverified: 1, changed: 2, verified: 3 }
+
+  /**
+   * Several actions in one call: every step checked before any runs (tool allowed, callable here, arguments valid),
+   * each step dispatched exactly as a direct call would be (policy, approval, the person's pause and stop, the lock,
+   * the result contract), stopping at the first failure, with one optional capture at the end. The target is focused
+   * by the first step that needs it; later steps find it in front and skip activating it.
+   */
+  async function runSteps(args: Record<string, unknown>, signal: AbortSignal | undefined, requestContext?: SessionRequestContext): Promise<ToolResult> {
+    const steps = Array.isArray(args.steps) ? args.steps as Array<{ tool?: unknown; args?: unknown }> : []
+    if (steps.length === 0) throw new Error('Invalid steps: expected at least one {tool, args}')
+    const batchTarget: Record<string, unknown> = {
+      ...(typeof args.target_app === 'string' && args.target_app ? { target_app: args.target_app } : {}),
+      ...(typeof args.target_window_id === 'number' ? { target_window_id: args.target_window_id } : {}),
+    }
+    const planned: Array<{ tool: string; args: Record<string, unknown> }> = []
+    const problems: Array<Record<string, unknown>> = []
+    steps.forEach((step, index) => {
+      const name = typeof step?.tool === 'string' ? step.tool : ''
+      const given = step?.args && typeof step.args === 'object' ? step.args as Record<string, unknown> : {}
+      if (!STEP_TOOLS.has(name)) { problems.push({ index, tool: name || null, message: 'not allowed in run_steps' }); return }
+      if (!callable(name)) { problems.push({ index, tool: name, message: 'not available in this profile or on this platform' }); return }
+      // A step without its own target uses the batch's, when the tool takes one.
+      const takesTarget = name !== 'wait' && name !== 'write_clipboard'
+      const hasOwn = given.target_app !== undefined || given.target_window_id !== undefined || given.window_id !== undefined
+      const merged = takesTarget && !hasOwn && !['click_element', 'set_value', 'press_button', 'fill_form'].includes(name)
+        ? { ...batchTarget, ...given }
+        : { ...given }
+      if ((name === 'click_element' || name === 'set_value' || name === 'press_button' || name === 'fill_form')
+        && merged.window_id === undefined && typeof batchTarget.target_window_id === 'number') merged.window_id = batchTarget.target_window_id
+      const checked = opts.validateArguments ? opts.validateArguments(name, merged) : { ok: true as const, args: merged }
+      if (!checked.ok) problems.push({ index, tool: name, issues: checked.issues })
+      else planned.push({ tool: name, args: checked.args })
+    })
+    if (problems.length > 0) {
+      return errJson({
+        error: 'invalid_arguments', tool: 'run_steps',
+        message: 'No step ran: fix the listed steps and call again.',
+        issues: problems,
+      })
+    }
+
+    const records: Array<Record<string, unknown>> = []
+    let failed: { index: number; result: ToolResult } | undefined
+    let weakest: Effect = 'verified'
+    for (const [index, step] of planned.entries()) {
+      // The person's pause or stop first: it also aborts the signal, and its refusal says more than "aborted".
+      if (MUTATING_TOOLS.has(step.tool)) {
+        const refusal = control.gate(step.tool)
+        if (refusal) {
+          failed = { index, result: errJson(refusal) }
+          records.push({ index, tool: step.tool, ok: false, error: refusal.error })
+          break
+        }
+      }
+      if (signal?.aborted) {
+        failed = { index, result: errJson({ error: 'aborted', message: 'The batch was cancelled before this step.' }) }
+        records.push({ index, tool: step.tool, ok: false, error: 'aborted' })
+        break
+      }
+      control.begin(describeAction(step.tool, step.args, resolvedFor(step.args)), { mutates: MUTATING_TOOLS.has(step.tool) })
+      const result = await dispatch(step.tool, step.args, signal, undefined, requestContext)
+      control.finish(result.isError ? 'failed' : 'done')
+      const reply = result.structuredContent ?? {}
+      const summary = result.content.find(block => block.type === 'text')
+      const record: Record<string, unknown> = {
+        index, tool: step.tool, ok: !result.isError,
+        ...(summary && summary.type === 'text' ? { summary: summary.text.slice(0, 200) } : {}),
+      }
+      for (const key of ['effect', 'route', 'delivery', 'error', 'hint'] as const) if (reply[key] !== undefined) record[key] = reply[key]
+      records.push(record)
+      if (result.isError) { failed = { index, result }; break }
+      const effect = reply.effect as Effect | undefined
+      if (effect && EFFECT_RANK[effect] < EFFECT_RANK[weakest]) weakest = effect
+      if (!effect && MUTATING_TOOLS.has(step.tool) && EFFECT_RANK.unverified < EFFECT_RANK[weakest]) weakest = 'unverified'
+    }
+    for (let index = records.length; index < planned.length; index++) {
+      records.push({ index, tool: planned[index].tool, ok: false, status: 'not_run' })
+    }
+
+    // One capture at the end: the window (or a region of it) or the screen, sent even when unchanged.
+    const capture = args.capture === 'window' || args.capture === 'screen' ? args.capture : 'none'
+    let images: ToolResult['content'] = []
+    if (capture !== 'none' && !signal?.aborted) {
+      const region = Array.isArray(args.region) && args.region.length === 4 ? args.region : undefined
+      const shot = capture === 'window' && region
+        ? await dispatch('zoom', { ...batchTarget, region }, signal, undefined, requestContext)
+        : await dispatch('screenshot', capture === 'screen' ? { full_screen: true, resend: true } : { ...batchTarget, resend: true }, signal, undefined, requestContext)
+      images = shot.isError ? [] : shot.content
+    }
+
+    const completed = records.filter(record => record.ok === true).length
+    const payload: Record<string, unknown> = { completed, total: planned.length, stopped_at: failed?.index ?? null, steps: records }
+    if (failed) {
+      // The steps before the failure ran and changed things; the reply says which, why the batch stopped, and the
+      // failing step's own advice.
+      const reason = failed.result.structuredContent ?? {}
+      const stepTool = planned[failed.index].tool
+      const refusal: Record<string, unknown> = {
+        ...payload,
+        error: 'step_failed',
+        failed_step: { index: failed.index, tool: stepTool, ...reason },
+        ...(typeof reason.hint === 'string' ? { hint: `Step ${failed.index + 1} (${stepTool}) failed: ${reason.hint}`.slice(0, 240) } : {}),
+        ...(reason.next_call ? { next_call: reason.next_call } : {}),
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(refusal) }, ...images], structuredContent: refusal, isError: true }
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(payload) }, ...images],
+      structuredContent: payload,
+      contract: {
+        effect: weakest,
+        ...(weakest === 'verified' ? {} : {
+          hint: images.length ? 'Every step ran; the capture above shows the result. Check it before the next step.'
+            : 'Every step ran; nothing confirms the unverified ones landed. Look before relying on them, or pass capture.',
+        }),
+      },
+    }
+  }
+
   /** The app and window a call is aimed at, as the policy and the target state resolve them, for the status card. */
   const resolvedFor = (args: Record<string, unknown>): { app?: string; window?: string } => {
     let app: string | undefined
@@ -579,11 +782,16 @@ export function createSession(opts: SessionOptions = {}): Session {
     // 7.6.1: the person's pause/stop state gates every mutation and aborts the one in flight.
     if (mutates) {
       const refusal = control.gate(tool)
-      if (refusal) return errJson(refusal)
+      if (refusal) return withRefusalAdvice(tool, args, errJson(refusal), callable)
     }
+    if ((mutates || CAPTURE_TOOLS.has(tool)) && !context?.preflight) {
+      const blocked = sessionRefusal(tool)
+      if (blocked) return withRefusalAdvice(tool, args, errJson(blocked), callable)
+    }
+    if (mutates) keepAwake()
     const effective = mutates ? control.signal(signal) : signal
     const tracked = !context?.preflight && getToolMeta(tool)?.job !== 'meta'
-    if (tracked) control.begin(describeAction(tool, args, resolvedFor(args)))
+    if (tracked) control.begin(describeAction(tool, args, resolvedFor(args)), { mutates })
     let outcome: 'done' | 'failed' = 'failed'
     try {
       const result = mutates
