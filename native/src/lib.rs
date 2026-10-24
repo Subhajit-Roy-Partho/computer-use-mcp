@@ -6,6 +6,8 @@ mod clipboard;
 mod display;
 mod keyboard;
 mod keychain;
+#[cfg(target_os = "linux")]
+mod linux_tools;
 mod mouse;
 mod overlay;
 mod permissions;

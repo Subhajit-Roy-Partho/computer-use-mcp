@@ -1,9 +1,9 @@
 // ── Linux implementation ──────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::linux_tools::run;
     use napi_derive::napi;
     use std::collections::HashMap;
-    use std::process::Command;
     use std::sync::OnceLock;
 
     static IS_WAYLAND: OnceLock<bool> = OnceLock::new();
@@ -27,6 +27,7 @@ mod linux {
             m.insert("space", 65);
             m.insert("backspace", 22);
             m.insert("delete", 119);
+            m.insert("forwarddelete", 119);
             m.insert("escape", 9);
             m.insert("esc", 9);
             m.insert("shift", 50);
@@ -38,6 +39,7 @@ mod linux {
             m.insert("command", 133);
             m.insert("cmd", 133);
             m.insert("win", 133);
+            m.insert("meta", 133);
             m.insert("capslock", 66);
             m.insert("f1", 67);
             m.insert("f2", 68);
@@ -51,6 +53,10 @@ mod linux {
             m.insert("f10", 76);
             m.insert("f11", 95);
             m.insert("f12", 96);
+            // F13–F20 (evdev KEY_F13 183 … KEY_F20 190, X keycode = evdev + 8). 7.7.0: accepted by the server, missing here.
+            for (i, name) in ["f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20"].into_iter().enumerate() {
+                m.insert(name, 191 + i as u32);
+            }
             m.insert("home", 110);
             m.insert("end", 115);
             m.insert("pageup", 112);
@@ -119,6 +125,16 @@ mod linux {
         x11_keycode.saturating_sub(8)
     }
 
+    fn ydotool_keys(codes: &[(u32, bool)]) -> napi::Result<()> {
+        let mut args: Vec<String> = vec!["key".to_string()];
+        for (code, down) in codes {
+            args.push(format!("{}:{}", x11_to_evdev(*code), if *down { 1 } else { 0 }));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run("ydotool", &args)?;
+        Ok(())
+    }
+
     fn ydotool_key_combo(combo: &str, repeat: i32) -> napi::Result<()> {
         let map = key_map();
         let combo_lower = combo.to_lowercase();
@@ -129,21 +145,25 @@ mod linux {
             let kc = map.get(part).copied().ok_or_else(|| {
                 napi::Error::from_reason(format!("Unknown key in combo: {combo}"))
             })?;
-            codes.push(x11_to_evdev(kc));
+            codes.push(kc);
         }
 
-        // Build ydotool key sequence: "keydown code keydown code ... keyup code keyup code"
+        // One ydotool call per repeat: every key down, then every key up in reverse.
         for _ in 0..repeat {
-            let mut args: Vec<String> = vec!["key".to_string()];
-            for &c in &codes {
-                args.push(format!("{}:1", c)); // key down
-            }
-            for c in codes.iter().rev() {
-                args.push(format!("{}:0", c)); // key up
-            }
-            let _ = Command::new("ydotool").args(&args).status();
+            let mut sequence: Vec<(u32, bool)> = codes.iter().map(|c| (*c, true)).collect();
+            sequence.extend(codes.iter().rev().map(|c| (*c, false)));
+            ydotool_keys(&sequence)?;
         }
         Ok(())
+    }
+
+    unsafe fn open_display() -> napi::Result<*mut x11::xlib::Display> {
+        let dpy = x11::xlib::XOpenDisplay(std::ptr::null());
+        if dpy.is_null() {
+            Err(napi::Error::from_reason("Cannot open the X display (is DISPLAY set? On Wayland, install ydotool)"))
+        } else {
+            Ok(dpy)
+        }
     }
 
     #[napi]
@@ -179,10 +199,7 @@ mod linux {
         unsafe {
             use x11::xlib::*;
             use x11::xtest::*;
-            let dpy = XOpenDisplay(std::ptr::null());
-            if dpy.is_null() {
-                return Err(napi::Error::from_reason("Cannot open X display"));
-            }
+            let dpy = open_display()?;
 
             for i in 0..repeat {
                 for &m in &modifiers {
@@ -204,76 +221,102 @@ mod linux {
     }
 
     #[napi]
-    pub fn type_text(text: String) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
+    pub fn type_text(text: String) -> napi::Result<()> {
+        // 7.7.0 (C4): a latched call is an error, not a silent success; (L1, L2) the tool's output is captured and a
+        // missing or failing tool is a named error.
+        crate::activity::ensure_not_emergency_stopped()?;
         if is_wayland() {
-            let _ = Command::new("ydotool").args(["type", "--", &text]).status();
+            run("ydotool", &["type", "--", &text])?;
         } else {
-            let _ = Command::new("xdotool")
-                .args(["type", "--clearmodifiers", &text])
-                .status();
+            run("xdotool", &["type", "--clearmodifiers", "--", &text])?;
+        }
+        Ok(())
+    }
+
+    // ── Held keys (7.7.0, C1/C2/C6) ─────────────────────────────────────────
+
+    /// X keycodes this process pressed and has not released, in press order.
+    static HELD_KEYS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+    fn held() -> std::sync::MutexGuard<'static, Vec<u32>> {
+        HELD_KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Resolve every name before pressing anything, so an unknown key never leaves the earlier ones held.
+    fn resolve_keys(keys: &[String]) -> napi::Result<Vec<u32>> {
+        let map = key_map();
+        let mut resolved = Vec::with_capacity(keys.len());
+        let mut unknown = Vec::new();
+        for k in keys {
+            match map.get(k.to_lowercase().as_str()) {
+                Some(&code) => resolved.push(code),
+                None => unknown.push(k.clone()),
+            }
+        }
+        if unknown.is_empty() {
+            Ok(resolved)
+        } else {
+            Err(napi::Error::from_reason(format!("Unknown key: {}", unknown.join(", "))))
         }
     }
 
-    #[napi]
-    pub fn hold_key(keys: Vec<String>, duration_ms: i32) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
-        let map = key_map();
-
-        if is_wayland() {
-            let mut down_args: Vec<String> = vec!["key".to_string()];
-            let mut up_args: Vec<String> = vec!["key".to_string()];
-            for k in &keys {
-                let lower = k.to_lowercase();
-                let kc = map
-                    .get(lower.as_str())
-                    .copied()
-                    .ok_or_else(|| napi::Error::from_reason(format!("Unknown key: {k}")))?;
-                let evdev = x11_to_evdev(kc);
-                down_args.push(format!("{}:1", evdev));
-                up_args.push(format!("{}:0", evdev));
-            }
-            let _ = Command::new("ydotool").args(&down_args).status();
-            let sleep_result = crate::activity::interruptible_sleep(
-                std::time::Duration::from_millis(duration_ms.max(0) as u64),
-            );
-            let _ = Command::new("ydotool").args(&up_args).status();
-            return sleep_result;
+    fn send(codes: &[u32], down: bool) -> napi::Result<()> {
+        if codes.is_empty() {
+            return Ok(());
         }
-
-        // X11 path
+        if is_wayland() {
+            let sequence: Vec<(u32, bool)> = codes.iter().map(|c| (*c, down)).collect();
+            return ydotool_keys(&sequence);
+        }
         unsafe {
             use x11::xlib::*;
             use x11::xtest::*;
-            let dpy = XOpenDisplay(std::ptr::null());
-            if dpy.is_null() {
-                return Err(napi::Error::from_reason("Cannot open X display"));
-            }
-
-            let mut pressed: Vec<u32> = Vec::new();
-            for k in &keys {
-                let lower = k.to_lowercase();
-                let kc = map
-                    .get(lower.as_str())
-                    .copied()
-                    .ok_or_else(|| napi::Error::from_reason(format!("Unknown key: {k}")))?;
-                XTestFakeKeyEvent(dpy, kc, 1, 0);
-                pressed.push(kc);
-            }
-            XFlush(dpy);
-            let sleep_result = crate::activity::interruptible_sleep(
-                std::time::Duration::from_millis(duration_ms.max(0) as u64),
-            );
-            for kc in pressed.into_iter().rev() {
-                XTestFakeKeyEvent(dpy, kc, 0, 0);
+            let dpy = open_display()?;
+            for code in codes {
+                XTestFakeKeyEvent(dpy, *code, if down { 1 } else { 0 }, 0);
             }
             XFlush(dpy);
             XCloseDisplay(dpy);
-            sleep_result?;
         }
         Ok(())
+    }
+
+    /// Press keys and keep them down until `key_up` (or the emergency latch) releases them.
+    #[napi]
+    pub fn key_down(keys: Vec<String>) -> napi::Result<()> {
+        let resolved = resolve_keys(&keys)?;
+        crate::activity::ensure_not_emergency_stopped()?;
+        let mut held = held();
+        let fresh: Vec<u32> = resolved.into_iter().filter(|code| !held.contains(code)).collect();
+        send(&fresh, true)?;
+        held.extend(fresh);
+        Ok(())
+    }
+
+    /// Release keys pressed by `key_down`, in reverse order; an empty list releases everything held. Not refused by
+    /// the emergency latch.
+    #[napi]
+    pub fn key_up(keys: Vec<String>) -> napi::Result<()> {
+        let mut held = held();
+        let codes = if keys.is_empty() { held.clone() } else { resolve_keys(&keys)? };
+        held.retain(|code| !codes.contains(code));
+        let reversed: Vec<u32> = codes.into_iter().rev().collect();
+        send(&reversed, false)
+    }
+
+    pub(crate) fn release_agent_held_keys() {
+        let _ = key_up(Vec::new());
+    }
+
+    /// Hold keys for a duration on this thread (older callers); the server uses `key_down` and `key_up`.
+    #[napi]
+    pub fn hold_key(keys: Vec<String>, duration_ms: i32) -> napi::Result<()> {
+        key_down(keys.clone())?;
+        let sleep_result = crate::activity::interruptible_sleep(std::time::Duration::from_millis(
+            duration_ms.max(0) as u64,
+        ));
+        key_up(keys)?;
+        sleep_result
     }
 }
 
@@ -446,7 +489,9 @@ mod macos {
             down.set_flags(flags);
             deliver(down, pid);
             let up = CGEvent::new_keyboard_event(source(), code, false).unwrap();
-            up.set_flags(flags);
+            // 7.7.0 (C3): the last event of the chord carries no modifier flags. A flagged final key-up left Shift or
+            // Command latched in the window server's modifier state (the class Peekaboo #797 measured).
+            up.set_flags(if i == repeat - 1 { CGEventFlags::CGEventFlagNull } else { flags });
             deliver(up, pid);
             if i < repeat - 1 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -467,14 +512,16 @@ mod macos {
     }
 
     fn type_text_impl(text: &str, pid: Option<i32>) -> napi::Result<()> {
-        if crate::activity::emergency_stop_active() {
-            return Ok(());
-        }
+        crate::activity::ensure_not_emergency_stopped()?;
         crate::permissions::ensure_input_trusted()?;
-        let chars: Vec<u16> = text.encode_utf16().collect();
-        for chunk in chars.chunks(20) {
+        let chunks = super::utf16_chunks(text, 20);
+        let total = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
+            // 7.7.0 (C4): stopped part-way is an error that says how far it got, never a silent success.
             if crate::activity::emergency_stop_active() {
-                return Ok(());
+                return Err(napi::Error::from_reason(format!(
+                    "EmergencyStop: typing stopped after {index} of {total} chunks; host reset required"
+                )));
             }
             let down = CGEvent::new_keyboard_event(source(), 0, true).unwrap();
             down.set_string_from_utf16_unchecked(chunk);
@@ -730,13 +777,14 @@ mod macos {
                     down.set_flags(flags);
                     deliver(down, pid);
                     let up = CGEvent::new_keyboard_event(source(), stroke.code, false).unwrap();
-                    up.set_flags(flags);
+                    // No flags on the key-up, so Shift or Option never stays latched after the text (7.7.0, C3).
+                    up.set_flags(CGEventFlags::CGEventFlagNull);
                     deliver(up, pid);
                     as_keys += 1;
                 }
                 None => {
                     let mut buf = [0u8; 4];
-                    type_text_impl(ch.encode_utf8(&mut buf), pid);
+                    type_text_impl(ch.encode_utf8(&mut buf), pid)?;
                     as_text += 1;
                 }
             }
@@ -760,35 +808,102 @@ mod macos {
         type_keys_impl(&text, Some(pid))
     }
 
+    // ── Held keys (7.7.0, C1/C2/C6) ─────────────────────────────────────────
+
+    /// Keys this process pressed and has not released, in press order, with their modifier flag. The emergency latch
+    /// releases them; `key_up` releases them by name. Releases are never refused by the latch.
+    static HELD_KEYS: std::sync::Mutex<Vec<(CGKeyCode, CGEventFlags)>> = std::sync::Mutex::new(Vec::new());
+
+    fn held() -> std::sync::MutexGuard<'static, Vec<(CGKeyCode, CGEventFlags)>> {
+        HELD_KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Resolve every name before pressing anything, so an unknown key never leaves the earlier ones held.
+    fn resolve_keys(keys: &[String]) -> napi::Result<Vec<(CGKeyCode, CGEventFlags)>> {
+        let map = key_code_map();
+        let mut resolved = Vec::with_capacity(keys.len());
+        let mut unknown = Vec::new();
+        for k in keys {
+            let lower = k.to_lowercase();
+            match map.get(lower.as_str()) {
+                Some(&code) => resolved.push((code, modifier_flag(&lower).unwrap_or(CGEventFlags::empty()))),
+                None => unknown.push(k.clone()),
+            }
+        }
+        if unknown.is_empty() {
+            Ok(resolved)
+        } else {
+            Err(napi::Error::from_reason(format!("Unknown key: {}", unknown.join(", "))))
+        }
+    }
+
+    fn held_flags(keys: &[(CGKeyCode, CGEventFlags)]) -> CGEventFlags {
+        keys.iter().fold(CGEventFlags::CGEventFlagNull, |flags, (_, flag)| flags | *flag)
+    }
+
+    /// Press keys and keep them down until `key_up` (or the emergency latch) releases them. Each key-down carries the
+    /// flags of every modifier held so far, as a real keyboard would.
     #[napi]
-    pub fn hold_key(keys: Vec<String>, duration_ms: i32) -> napi::Result<()> {
+    pub fn key_down(keys: Vec<String>) -> napi::Result<()> {
+        let resolved = resolve_keys(&keys)?;
         crate::activity::ensure_not_emergency_stopped()?;
         crate::permissions::ensure_input_trusted()?;
-        let map = key_code_map();
-        let mut pressed: Vec<(CGKeyCode, CGEventFlags)> = Vec::new();
-
-        for k in &keys {
-            let lower = k.to_lowercase();
-            let flag = modifier_flag(&lower).unwrap_or(CGEventFlags::empty());
-            let code = map
-                .get(lower.as_str())
-                .copied()
-                .ok_or_else(|| napi::Error::from_reason(format!("Unknown key: {k}")))?;
-            let down = CGEvent::new_keyboard_event(source(), code, true).unwrap();
-            down.set_flags(flag);
+        let mut held = held();
+        for (code, flag) in resolved {
+            if held.iter().any(|(held_code, _)| *held_code == code) {
+                continue;
+            }
+            held.push((code, flag));
+            let down = CGEvent::new_keyboard_event(source(), code, true)
+                .map_err(|_| napi::Error::from_reason("Could not create key event"))?;
+            down.set_flags(held_flags(&held));
             deliver(down, None);
-            pressed.push((code, flag));
         }
+        Ok(())
+    }
 
+    fn release(code: CGKeyCode, held: &mut Vec<(CGKeyCode, CGEventFlags)>) {
+        held.retain(|(held_code, _)| *held_code != code);
+        if let Ok(up) = CGEvent::new_keyboard_event(source(), code, false) {
+            // The flags of what is still held; none once the last key is up (C3).
+            up.set_flags(held_flags(held));
+            deliver(up, None);
+        }
+    }
+
+    /// Release keys pressed by `key_down`, in reverse order; an empty list releases everything held. Not refused by
+    /// the emergency latch: a release is always safe.
+    #[napi]
+    pub fn key_up(keys: Vec<String>) -> napi::Result<()> {
+        let mut held = held();
+        let codes: Vec<CGKeyCode> = if keys.is_empty() {
+            held.iter().map(|(code, _)| *code).collect()
+        } else {
+            resolve_keys(&keys)?.into_iter().map(|(code, _)| code).collect()
+        };
+        for code in codes.into_iter().rev() {
+            release(code, &mut held);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_agent_held_keys() {
+        let mut held = held();
+        let codes: Vec<CGKeyCode> = held.iter().map(|(code, _)| *code).collect();
+        for code in codes.into_iter().rev() {
+            release(code, &mut held);
+        }
+    }
+
+    /// Hold keys for a duration on this thread. The server holds keys with `key_down`, an awaited timer and `key_up`
+    /// instead (7.7.0), so the event loop stays free; this stays for older callers, and releases on every exit.
+    #[napi]
+    pub fn hold_key(keys: Vec<String>, duration_ms: i32) -> napi::Result<()> {
+        key_down(keys.clone())?;
         let sleep_result = crate::activity::interruptible_sleep(std::time::Duration::from_millis(
             duration_ms.max(0) as u64,
         ));
-
-        for (code, flags) in pressed.into_iter().rev() {
-            let up = CGEvent::new_keyboard_event(source(), code, false).unwrap();
-            up.set_flags(flags);
-            deliver(up, None);
-        }
+        key_up(keys)?;
         sleep_result
     }
 }
@@ -812,6 +927,7 @@ mod win {
             m.insert("space", VK_SPACE);
             m.insert("backspace", VK_BACK);
             m.insert("delete", VK_DELETE);
+            m.insert("forwarddelete", VK_DELETE);
             m.insert("escape", VK_ESCAPE);
             m.insert("esc", VK_ESCAPE);
             // Modifiers
@@ -819,6 +935,7 @@ mod win {
             m.insert("cmd", VK_LWIN);
             m.insert("super", VK_LWIN);
             m.insert("win", VK_LWIN);
+            m.insert("meta", VK_LWIN);
             m.insert("shift", VK_SHIFT);
             m.insert("control", VK_CONTROL);
             m.insert("ctrl", VK_CONTROL);
@@ -826,19 +943,12 @@ mod win {
             m.insert("alt", VK_MENU);
             m.insert("fn", VK_F24); // no direct equiv
             m.insert("capslock", VK_CAPITAL);
-            // Function keys
-            m.insert("f1", VK_F1);
-            m.insert("f2", VK_F2);
-            m.insert("f3", VK_F3);
-            m.insert("f4", VK_F4);
-            m.insert("f5", VK_F5);
-            m.insert("f6", VK_F6);
-            m.insert("f7", VK_F7);
-            m.insert("f8", VK_F8);
-            m.insert("f9", VK_F9);
-            m.insert("f10", VK_F10);
-            m.insert("f11", VK_F11);
-            m.insert("f12", VK_F12);
+            // Function keys, F1–F20 (7.7.0: F13–F20 were accepted by the server and missing here)
+            for (i, name) in ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14",
+                "f15", "f16", "f17", "f18", "f19", "f20"].into_iter().enumerate()
+            {
+                m.insert(name, VIRTUAL_KEY(VK_F1.0 + i as u16));
+            }
             // Navigation
             m.insert("home", VK_HOME);
             m.insert("end", VK_END);
@@ -882,26 +992,37 @@ mod win {
         )
     }
 
-    fn send_key(vk: VIRTUAL_KEY, down: bool) {
-        let flags = if down {
-            KEYBD_EVENT_FLAGS(0)
+    /// Send input events in one atomic `SendInput` call. 7.7.0 (W2): `SendInput` returns how many events it inserted
+    /// and does not signal input blocked by UIPI any other way; fewer than asked is now an error, not a success.
+    pub(crate) fn send_inputs(inputs: &[INPUT]) -> napi::Result<()> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent == inputs.len() {
+            Ok(())
         } else {
-            KEYEVENTF_KEYUP
-        };
-        let input = INPUT {
+            Err(napi::Error::from_reason(format!(
+                "input_blocked: Windows accepted {sent} of {} input events. The foreground window may belong to an \
+                 elevated (administrator) process, or the lock screen or a UAC prompt is up; Windows blocks input to \
+                 those from a normal process.",
+                inputs.len()
+            )))
+        }
+    }
+
+    fn key_input(vk: VIRTUAL_KEY, down: bool) -> INPUT {
+        INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: vk,
                     wScan: 0,
-                    dwFlags: flags,
+                    dwFlags: if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP },
                     time: 0,
                     dwExtraInfo: 0,
                 },
             },
-        };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
         }
     }
 
@@ -931,14 +1052,12 @@ mod win {
 
         for i in 0..repeat {
             crate::activity::ensure_not_emergency_stopped()?;
-            for &m in &modifiers {
-                send_key(m, true);
-            }
-            send_key(key, true);
-            send_key(key, false);
-            for m in modifiers.iter().rev() {
-                send_key(*m, false);
-            }
+            // The whole chord in one SendInput: atomic, so a failure can never leave a modifier down.
+            let mut chord: Vec<INPUT> = modifiers.iter().map(|m| key_input(*m, true)).collect();
+            chord.push(key_input(key, true));
+            chord.push(key_input(key, false));
+            chord.extend(modifiers.iter().rev().map(|m| key_input(*m, false)));
+            send_inputs(&chord)?;
             if i < repeat - 1 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -947,19 +1066,14 @@ mod win {
     }
 
     #[napi]
-    pub fn type_text(text: String) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
+    pub fn type_text(text: String) -> napi::Result<()> {
+        // 7.7.0 (C4): a latched call is an error, not a silent success.
+        crate::activity::ensure_not_emergency_stopped()?;
         // Build ALL key events up front and dispatch them in a single SendInput
         // call. Sending one char per SendInput (with a sleep between) races the
         // target app's message pump and intermittently drops characters on
         // UWP/RichEdit controls (e.g. Windows 11 Notepad). A batched SendInput
         // is atomic and reliably queued, so no characters are lost.
-        //
-        // Newlines are emitted as real VK_RETURN presses (Enter); a bare
-        // KEYEVENTF_UNICODE 0x0A is ignored by many editors. Carriage returns
-        // are skipped so "\r\n" does not double up.
         let unicode_event = |ch: u16, key_up: bool| INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -976,48 +1090,156 @@ mod win {
                 },
             },
         };
-        // Send every UTF-16 code unit as a KEYEVENTF_UNICODE down/up pair in a
-        // SINGLE batched SendInput call. Batching is atomic and reliably queued,
-        // which fixes the character drops seen when injecting one char per
-        // SendInput. Newlines (0x0A) are passed through as unicode; callers that
-        // need robust multi-line entry should use the clipboard-paste path in
-        // the session layer, which is the reliable route on UWP controls.
+        // Every UTF-16 code unit as a KEYEVENTF_UNICODE down/up pair, except line breaks: "\n" is a real Enter
+        // (VK_RETURN), because a bare KEYEVENTF_UNICODE 0x0A is ignored by many editors (7.7.0, W5), and "\r" is
+        // skipped so "\r\n" is one Enter. Long or multi-line text normally takes the session's clipboard route.
         let mut inputs: Vec<INPUT> = Vec::with_capacity(text.encode_utf16().count() * 2);
         for ch in text.encode_utf16() {
-            inputs.push(unicode_event(ch, false));
-            inputs.push(unicode_event(ch, true));
+            match ch {
+                0x0D => {}
+                0x0A => {
+                    inputs.push(key_input(VK_RETURN, true));
+                    inputs.push(key_input(VK_RETURN, false));
+                }
+                _ => {
+                    inputs.push(unicode_event(ch, false));
+                    inputs.push(unicode_event(ch, true));
+                }
+            }
         }
-        if inputs.is_empty() {
-            return;
+        send_inputs(&inputs)
+    }
+
+    // ── Held keys (7.7.0, C1/C2/C6) ─────────────────────────────────────────
+
+    /// Keys this process pressed and has not released, in press order; released by `key_up` or the emergency latch.
+    static HELD_KEYS: std::sync::Mutex<Vec<VIRTUAL_KEY>> = std::sync::Mutex::new(Vec::new());
+
+    fn held() -> std::sync::MutexGuard<'static, Vec<VIRTUAL_KEY>> {
+        HELD_KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Resolve every name before pressing anything, so an unknown key never leaves the earlier ones held.
+    fn resolve_keys(keys: &[String]) -> napi::Result<Vec<VIRTUAL_KEY>> {
+        let map = key_map();
+        let mut resolved = Vec::with_capacity(keys.len());
+        let mut unknown = Vec::new();
+        for k in keys {
+            match map.get(k.to_lowercase().as_str()) {
+                Some(&vk) => resolved.push(vk),
+                None => unknown.push(k.clone()),
+            }
         }
-        unsafe {
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        if unknown.is_empty() {
+            Ok(resolved)
+        } else {
+            Err(napi::Error::from_reason(format!("Unknown key: {}", unknown.join(", "))))
         }
     }
 
+    /// Press keys and keep them down until `key_up` (or the emergency latch) releases them.
+    #[napi]
+    pub fn key_down(keys: Vec<String>) -> napi::Result<()> {
+        let resolved = resolve_keys(&keys)?;
+        crate::activity::ensure_not_emergency_stopped()?;
+        let mut held = held();
+        let fresh: Vec<VIRTUAL_KEY> = resolved.into_iter().filter(|vk| !held.contains(vk)).collect();
+        let downs: Vec<INPUT> = fresh.iter().map(|vk| key_input(*vk, true)).collect();
+        send_inputs(&downs)?;
+        held.extend(fresh);
+        Ok(())
+    }
+
+    fn release(vks: Vec<VIRTUAL_KEY>, held: &mut Vec<VIRTUAL_KEY>) -> napi::Result<()> {
+        held.retain(|vk| !vks.contains(vk));
+        let ups: Vec<INPUT> = vks.iter().rev().map(|vk| key_input(*vk, false)).collect();
+        send_inputs(&ups)
+    }
+
+    /// Release keys pressed by `key_down`, in reverse order; an empty list releases everything held. Not refused by
+    /// the emergency latch.
+    #[napi]
+    pub fn key_up(keys: Vec<String>) -> napi::Result<()> {
+        let mut held = held();
+        let vks = if keys.is_empty() { held.clone() } else { resolve_keys(&keys)? };
+        release(vks, &mut held)
+    }
+
+    pub(crate) fn release_agent_held_keys() {
+        let mut held = held();
+        let vks = held.clone();
+        let _ = release(vks, &mut held);
+    }
+
+    /// Hold keys for a duration on this thread (older callers); the server uses `key_down` and `key_up`.
     #[napi]
     pub fn hold_key(keys: Vec<String>, duration_ms: i32) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
-        let map = key_map();
-        let mut pressed: Vec<VIRTUAL_KEY> = Vec::new();
-
-        for k in &keys {
-            let lower = k.to_lowercase();
-            let vk = map
-                .get(lower.as_str())
-                .copied()
-                .ok_or_else(|| napi::Error::from_reason(format!("Unknown key: {k}")))?;
-            send_key(vk, true);
-            pressed.push(vk);
-        }
-
+        key_down(keys.clone())?;
         let sleep_result = crate::activity::interruptible_sleep(std::time::Duration::from_millis(
             duration_ms.max(0) as u64,
         ));
-
-        for vk in pressed.into_iter().rev() {
-            send_key(vk, false);
-        }
+        key_up(keys)?;
         sleep_result
+    }
+}
+
+/// Split text into UTF-16 chunks of at most `max` code units without splitting a surrogate pair (7.7.0, C5): a chunk
+/// boundary inside an emoji's pair typed two broken halves.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn utf16_chunks(text: &str, max: usize) -> Vec<Vec<u16>> {
+    let mut chunks: Vec<Vec<u16>> = Vec::new();
+    let mut current: Vec<u16> = Vec::with_capacity(max);
+    let mut buffer = [0u16; 2];
+    for ch in text.chars() {
+        let units = ch.encode_utf16(&mut buffer);
+        if !current.is_empty() && current.len() + units.len() > max.max(2) {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.extend_from_slice(units);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Release every key this process holds. Called on the emergency latch's own thread; never refused by the latch.
+pub(crate) fn release_agent_held_keys() {
+    #[cfg(target_os = "macos")]
+    macos::release_agent_held_keys();
+    #[cfg(target_os = "windows")]
+    win::release_agent_held_keys();
+    #[cfg(target_os = "linux")]
+    linux::release_agent_held_keys();
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use win::send_inputs;
+
+#[cfg(test)]
+mod tests {
+    use super::utf16_chunks;
+
+    #[test]
+    fn chunks_never_split_a_surrogate_pair() {
+        // 19 ASCII letters then an emoji (2 units): the emoji moves whole into the next chunk.
+        let text = format!("{}😀tail", "a".repeat(19));
+        let chunks = utf16_chunks(&text, 20);
+        assert_eq!(chunks[0].len(), 19);
+        for chunk in &chunks {
+            assert!(String::from_utf16(chunk).is_ok(), "every chunk is valid UTF-16");
+            assert!(chunk.len() <= 20);
+        }
+        let joined: Vec<u16> = chunks.concat();
+        assert_eq!(String::from_utf16(&joined).unwrap(), text);
+    }
+
+    #[test]
+    fn chunking_keeps_all_text_and_handles_the_edges() {
+        assert!(utf16_chunks("", 20).is_empty());
+        assert_eq!(utf16_chunks("abc", 20), vec!["abc".encode_utf16().collect::<Vec<u16>>()]);
+        let emoji = "😀".repeat(15); // 30 units
+        let chunks = utf16_chunks(&emoji, 20);
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), vec![20, 10]);
     }
 }

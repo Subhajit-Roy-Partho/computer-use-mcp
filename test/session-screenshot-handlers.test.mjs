@@ -50,8 +50,15 @@ test('extracted screenshot handler deduplicates captures and exposes an immutabl
   })
   const first = f.handler.handle('screenshot', {})
   const second = f.handler.handle('screenshot', {})
-  assert.strictEqual(second, first)
+  // 7.7.0 (K3): the unchanged frame comes back as text, three times in a row at most; the fourth sends the image.
+  assert.equal(JSON.parse(second.content[0].text).unchanged, true)
   assert.equal(f.native.calls[1][4], 'h1')
+  const third = f.handler.handle('screenshot', {})
+  const fourth = f.handler.handle('screenshot', {})
+  assert.equal(JSON.parse(third.content[0].text).repeats, 2)
+  assert.equal(JSON.parse(fourth.content[0].text).repeats, 3)
+  assert.strictEqual(f.handler.handle('screenshot', {}), first, 'after the streak cap the image is sent again')
+  assert.equal(JSON.parse(f.handler.handle('screenshot', {}).content[0].text).repeats, 1, 'and the streak restarts')
   assert.deepEqual(f.handler.lastScreenshot(), {
     mimeType: 'image/png', data: 'raw', capturedAt: 30,
   })
@@ -164,4 +171,36 @@ test('zoom still crops when the native export is present', () => {
   const result = f.handler.handle('zoom', { region: [10, 10, 50, 50] })
   assert.equal(result.isError, undefined)
   assert.ok(f.native.calls.some(([kind]) => kind === 'crop'), 'the native crop should be used')
+})
+
+// ── 7.7.0 (C7): a cancelled capture is cancelled ────────────────────────────────────────────────────────────
+import { HelperFailure } from '../dist/session/macos-helper.js'
+
+test('a screenshot cancelled during the helper capture never falls through to a second capture', async () => {
+  const f = fixture()
+  const controller = new AbortController()
+  const helper = {
+    supportsCapture: () => true,
+    capture: async () => { controller.abort(new Error('Desktop control paused by person')); throw new HelperFailure('aborted', 'helper call aborted') },
+  }
+  const handler = new ScreenshotHandler({
+    native: f.native, targets: f.targets, pointer: f.pointer, visionEnabled: true, defaultProvider: 'auto', env: {}, helper,
+  })
+  await assert.rejects(handler.handleAsync('screenshot', { target_window_id: 42 }, controller.signal), /paused by person/)
+  assert.equal(f.native.calls.filter(call => call[0] === 'screenshot').length, 0, 'no fallback capture ran')
+  // Already cancelled before it starts: nothing is captured at all.
+  await assert.rejects(handler.handleAsync('screenshot', {}, controller.signal), /paused by person/)
+  await assert.rejects(handler.handleAsync('zoom', { region: [0, 0, 10, 10] }, controller.signal), /paused by person/)
+  assert.equal(f.native.calls.length, 0)
+})
+
+test('a helper failure that is not a cancellation still falls back to the native capture', async () => {
+  const f = fixture()
+  const helper = { supportsCapture: () => true, capture: async () => { throw new HelperFailure('sck_timeout', 'stalled') } }
+  const handler = new ScreenshotHandler({
+    native: f.native, targets: f.targets, pointer: f.pointer, visionEnabled: true, defaultProvider: 'auto', env: {}, helper,
+  })
+  const result = await handler.handleAsync('screenshot', { target_window_id: 42 })
+  assert.equal(result.content[0].type, 'image')
+  assert.equal(handler.helperFailure(), 'sck_timeout: stalled')
 })

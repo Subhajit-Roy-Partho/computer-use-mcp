@@ -174,7 +174,7 @@ test('targeted clicks are remembered for later keyboard actions', async () => {
   assert.deepEqual(activations, ['com.apple.Safari', 'com.apple.Safari'])
 })
 
-test('screenshot dedup reuses the cached result when the image hash is unchanged', async () => {
+test('screenshot dedup answers an unchanged capture with text, not the same image again (7.7.0 K3)', async () => {
   const previousHashes = []
   let captures = 0
   const native = createMockNative({
@@ -207,7 +207,15 @@ test('screenshot dedup reuses the cached result when the image hash is unchanged
 
   assert.equal(previousHashes[0], undefined)
   assert.equal(previousHashes[1], 'hash-1')
-  assert.strictEqual(second, first)
+  assert.equal(second.content.some(block => block.type === 'image'), false, 'no image for an unchanged frame')
+  const reply = JSON.parse(second.content[0].text)
+  assert.equal(reply.unchanged, true)
+  assert.equal(reply.image_omitted, true)
+  assert.equal(reply.hash, 'hash-1')
+  assert.match(reply.mapping, /screen_x/)
+  // resend: true always sends the image.
+  const third = await session.dispatch('screenshot', { resend: true })
+  assert.deepEqual(third.content, first.content)
 })
 
 test('focus failures return structured diagnostics', async () => {

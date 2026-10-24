@@ -9,6 +9,7 @@ import type { MacosHelper } from './macos-helper.js'
 import { inputClassFor, type PidDeliveryStore, type PidOutcome } from './pid-delivery.js'
 import type { UserActivityGuard } from './user-activity.js'
 import { resolveAppWindow } from './window-select.js'
+import { sleepAbortable } from './spawn.js'
 
 type ExecFile = typeof defaultExecFileSync
 
@@ -22,7 +23,11 @@ const INPUT_TOOLS = new Set([
 
 /** Tools that neither post input nor activate anything. */
 const NON_PHYSICAL_TOOLS = new Set(['cursor_position', 'read_clipboard', 'write_clipboard', 'set_target', 'get_target'])
-/** `hold_key` sleeps on the server thread (one native call), so a hold is capped; longer holds would block every tool. */
+/**
+ * The longest `hold_key`. Since 7.7.0 a hold is a native key-down, an awaited timer and a key-up, so it no longer
+ * blocks the server (Pause, Stop and cancellation reach it at once and the keys are released); the cap stays so a
+ * forgotten hold cannot keep keys down for long.
+ */
 export const MAX_HOLD_SECONDS = 10
 
 /** v7.5 (R5): tools whose input can be posted to the target process instead. */
@@ -500,12 +505,25 @@ export class InputHandler {
       const keys = normalizeHeldKeys(args.keys, this.#platform)
       const resolved = target()
       await focus(resolved)
-      // The native hold sleeps on the server thread, so cap it: a long hold would block every other tool.
       const requested = number('duration', 1)
       const duration = Math.min(Math.max(requested, 0), MAX_HOLD_SECONDS)
-      try {
-        this.#native.holdKey(keys, duration * 1000)
-      } catch (error) { throw explainNativeKeyError(error) }
+      if (this.#native.keyDown && this.#native.keyUp) {
+        // 7.7.0 (C6): press, await, release. The event loop stays free during the hold, so the status card's Pause and
+        // Stop, notifications/cancelled and control_status all work, and the keys come up on every exit path.
+        try { this.#native.keyDown(keys) } catch (error) { throw explainNativeKeyError(error) }
+        let interrupted = false
+        try {
+          interrupted = await sleepAbortable(duration * 1000, signal)
+        } finally {
+          this.#native.keyUp(keys)
+        }
+        if (interrupted) throw new Error(`hold_key interrupted after the keys went down; they are released`)
+      } else {
+        // An older native module: the hold sleeps on the server thread.
+        try {
+          this.#native.holdKey(keys, duration * 1000)
+        } catch (error) { throw explainNativeKeyError(error) }
+      }
       if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
       return ok(requested > MAX_HOLD_SECONDS ? `Held for ${duration} s (capped from ${requested} s)` : 'Held')
     }

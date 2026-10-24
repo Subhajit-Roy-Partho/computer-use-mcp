@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ScriptingService } from '../dist/session/scripting-service.js'
+import { POWERSHELL_UTF8_PREFIX, ScriptingService } from '../dist/session/scripting-service.js'
 
 const success = (stdout = '') => ({ stdout, stderr: '', code: 0, timedOut: false })
 
@@ -28,16 +28,20 @@ test('scripting dictionaries are summarized, cached by PID, and suite-filterable
   assert.equal(calls.filter(call => call[0] === 'sdef').length, 2)
 })
 
-test('Windows scripts use UTF-16LE EncodedCommand when quoting requires it', async () => {
+test('Windows scripts always run as UTF-16LE EncodedCommand with UTF-8 output (7.7.0 W6)', async () => {
   const calls = []
   const service = new ScriptingService({
     native: {}, platform: 'win32', execFile: () => Buffer.from(''),
     spawnBounded: async (command, args) => { calls.push([command, ...args]); return success() },
   })
   await service.runScript('powershell', 'Write-Host "hello"', 1000)
-  assert.equal(calls[0][0], 'pwsh')
-  assert.equal(calls[0][3], '-EncodedCommand')
-  assert.equal(Buffer.from(calls[0][4], 'base64').toString('utf16le'), 'Write-Host "hello"')
+  await service.runScript('powershell', 'Get-Date', 1000)
+  for (const [script, call] of [['Write-Host "hello"', calls[0]], ['Get-Date', calls[1]]]) {
+    assert.equal(call[0], 'pwsh')
+    assert.equal(call[3], '-EncodedCommand')
+    assert.equal(Buffer.from(call[4], 'base64').toString('utf16le'), POWERSHELL_UTF8_PREFIX + script)
+  }
+  assert.match(POWERSHELL_UTF8_PREFIX, /\[Console\]::OutputEncoding = \[System\.Text\.UTF8Encoding\]::new\(\$false\)/)
 })
 
 test('platform-incompatible script languages fail without spawning a process', async () => {

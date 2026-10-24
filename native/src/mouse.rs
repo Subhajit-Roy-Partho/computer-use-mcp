@@ -2,10 +2,12 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use napi_derive::napi;
-    use std::process::Command;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::OnceLock;
 
     static IS_WAYLAND: OnceLock<bool> = OnceLock::new();
+    /// Buttons this process pressed and has not released (bits: 1 left, 2 right, 4 middle); released by the latch.
+    static AGENT_BUTTONS_HELD: AtomicU8 = AtomicU8::new(0);
 
     fn is_wayland() -> bool {
         *IS_WAYLAND.get_or_init(|| {
@@ -16,7 +18,7 @@ mod linux {
     }
 
     fn ydotool_available() -> bool {
-        Command::new("ydotool").arg("--help").output().is_ok()
+        crate::linux_tools::available("ydotool")
     }
 
     mod x11_impl {
@@ -24,28 +26,31 @@ mod linux {
         use x11::xlib::*;
         use x11::xtest::*;
 
-        pub unsafe fn open_display() -> *mut Display {
-            XOpenDisplay(ptr::null())
+        /// Open the X display or say why not (7.7.0: before, every call returned silently when DISPLAY was unset).
+        pub unsafe fn open_display() -> napi::Result<*mut Display> {
+            let dpy = XOpenDisplay(ptr::null());
+            if dpy.is_null() {
+                Err(napi::Error::from_reason(
+                    "Cannot open the X display (is DISPLAY set? On Wayland, install ydotool)",
+                ))
+            } else {
+                Ok(dpy)
+            }
         }
 
-        pub fn mouse_move(x: i32, y: i32) {
+        pub fn mouse_move(x: i32, y: i32) -> napi::Result<()> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return;
-                }
+                let dpy = open_display()?;
                 XWarpPointer(dpy, 0, XDefaultRootWindow(dpy), 0, 0, 0, 0, x, y);
                 XFlush(dpy);
                 XCloseDisplay(dpy);
             }
+            Ok(())
         }
 
-        pub fn mouse_click(x: i32, y: i32, btn: u32, count: i32, additive: bool) {
+        pub fn mouse_click(x: i32, y: i32, btn: u32, count: i32, additive: bool) -> napi::Result<()> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return;
-                }
+                let dpy = open_display()?;
                 XWarpPointer(dpy, 0, XDefaultRootWindow(dpy), 0, 0, 0, 0, x, y);
                 XFlush(dpy);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -68,27 +73,25 @@ mod linux {
                 XFlush(dpy);
                 XCloseDisplay(dpy);
             }
+            Ok(())
         }
 
-        pub fn mouse_button(press: bool, x: i32, y: i32) {
+        pub fn button_event(btn: u32, press: bool, at: Option<(i32, i32)>) -> napi::Result<()> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return;
+                let dpy = open_display()?;
+                if let Some((x, y)) = at {
+                    XWarpPointer(dpy, 0, XDefaultRootWindow(dpy), 0, 0, 0, 0, x, y);
                 }
-                XWarpPointer(dpy, 0, XDefaultRootWindow(dpy), 0, 0, 0, 0, x, y);
-                XTestFakeButtonEvent(dpy, 1, if press { 1 } else { 0 }, 0);
+                XTestFakeButtonEvent(dpy, btn, if press { 1 } else { 0 }, 0);
                 XFlush(dpy);
                 XCloseDisplay(dpy);
             }
+            Ok(())
         }
 
-        pub fn mouse_scroll(dy: i32, dx: i32) {
+        pub fn mouse_scroll(dy: i32, dx: i32) -> napi::Result<()> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return;
-                }
+                let dpy = open_display()?;
                 if dy != 0 {
                     let btn = if dy > 0 { 5u32 } else { 4 };
                     for _ in 0..dy.unsigned_abs() {
@@ -106,6 +109,7 @@ mod linux {
                 XFlush(dpy);
                 XCloseDisplay(dpy);
             }
+            Ok(())
         }
 
         /// Press, drag or release a chosen button, optionally holding modifiers.
@@ -113,12 +117,9 @@ mod linux {
         /// `which` is 0 press, 1 drag, 2 release. Modifiers are pressed before the
         /// button event and released after it; a caller holding them across a whole
         /// path passes them on every call, which X11 coalesces harmlessly.
-        pub fn pointer_event(x: i32, y: i32, btn: u32, keysyms: &[u64], which: u8) {
+        pub fn pointer_event(x: i32, y: i32, btn: u32, keysyms: &[u64], which: u8) -> napi::Result<()> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return;
-                }
+                let dpy = open_display()?;
                 let codes: Vec<u32> = keysyms
                     .iter()
                     .map(|sym| XKeysymToKeycode(dpy, *sym) as u32)
@@ -144,14 +145,12 @@ mod linux {
                 XFlush(dpy);
                 XCloseDisplay(dpy);
             }
+            Ok(())
         }
 
-        pub fn cursor_position() -> (i32, i32) {
+        pub fn cursor_position() -> napi::Result<(i32, i32)> {
             unsafe {
-                let dpy = open_display();
-                if dpy.is_null() {
-                    return (0, 0);
-                }
+                let dpy = open_display()?;
                 let root = XDefaultRootWindow(dpy);
                 let mut root_ret = 0u64;
                 let mut child_ret = 0u64;
@@ -172,107 +171,75 @@ mod linux {
                     &mut mask,
                 );
                 XCloseDisplay(dpy);
-                (rx, ry)
+                Ok((rx, ry))
             }
         }
     }
 
     mod wayland_impl {
-        use std::process::Command;
+        use crate::linux_tools::run;
 
-        pub fn mouse_move(x: i32, y: i32) {
-            let _ = Command::new("ydotool")
-                .args([
-                    "mousemove",
-                    "--absolute",
-                    "-x",
-                    &x.to_string(),
-                    "-y",
-                    &y.to_string(),
-                ])
-                .status();
+        pub fn mouse_move(x: i32, y: i32) -> napi::Result<()> {
+            run("ydotool", &["mousemove", "--absolute", "-x", &x.to_string(), "-y", &y.to_string()])?;
+            Ok(())
         }
 
-        pub fn mouse_click(x: i32, y: i32, btn: u32, count: i32) {
-            // Move first
-            mouse_move(x, y);
+        /// ydotool button codes: 0x00 left, 0x01 right, 0x02 middle; 0x40 adds "down", 0x80 "up", 0xC0 a click.
+        fn ydotool_button(btn: u32) -> u32 {
+            match btn {
+                2 => 0x02,
+                3 => 0x01,
+                _ => 0x00,
+            }
+        }
+
+        pub fn mouse_click(x: i32, y: i32, btn: u32, count: i32) -> napi::Result<()> {
+            mouse_move(x, y)?;
             std::thread::sleep(std::time::Duration::from_millis(10));
-            // ydotool button codes: 0x00=left, 0x01=right, 0x02=middle
-            let ydotool_btn = match btn {
-                1 => "0x00",
-                2 => "0x02",
-                3 => "0x01",
-                _ => "0x00",
-            };
+            let code = format!("0x{:02X}", 0xC0 | ydotool_button(btn));
             for i in 0..count {
-                let _ = Command::new("ydotool")
-                    .args(["click", ydotool_btn])
-                    .status();
+                run("ydotool", &["click", &code])?;
                 if i < count - 1 {
                     std::thread::sleep(std::time::Duration::from_millis(30));
                 }
             }
+            Ok(())
         }
 
-        pub fn mouse_button(press: bool, x: i32, y: i32) {
-            mouse_move(x, y);
-            // ydotool click with --down or --up
-            if press {
-                let _ = Command::new("ydotool")
-                    .args(["click", "--down", "0x00"])
-                    .status();
-            } else {
-                let _ = Command::new("ydotool")
-                    .args(["click", "--up", "0x00"])
-                    .status();
-            }
+        pub fn button_event(btn: u32, press: bool) -> napi::Result<()> {
+            let code = format!("0x{:02X}", if press { 0x40 } else { 0x80 } | ydotool_button(btn));
+            run("ydotool", &["click", &code])?;
+            Ok(())
         }
 
-        pub fn mouse_scroll(dy: i32, dx: i32) {
+        pub fn mouse_scroll(dy: i32, dx: i32) -> napi::Result<()> {
             if dy != 0 {
                 // Negative = scroll up in ydotool
-                let _ = Command::new("ydotool")
-                    .args([
-                        "mousemove",
-                        "--wheel",
-                        "--",
-                        "-x",
-                        "0",
-                        "-y",
-                        &(-dy * 15).to_string(),
-                    ])
-                    .status();
+                run("ydotool", &["mousemove", "--wheel", "--", "-x", "0", "-y", &(-dy * 15).to_string()])?;
             }
             if dx != 0 {
-                let _ = Command::new("ydotool")
-                    .args([
-                        "mousemove",
-                        "--wheel",
-                        "--",
-                        "-x",
-                        &(dx * 15).to_string(),
-                        "-y",
-                        "0",
-                    ])
-                    .status();
+                run("ydotool", &["mousemove", "--wheel", "--", "-x", &(dx * 15).to_string(), "-y", "0"])?;
             }
+            Ok(())
         }
 
-        pub fn cursor_position() -> (i32, i32) {
+        pub fn cursor_position() -> napi::Result<(i32, i32)> {
             // Wayland doesn't expose cursor position easily; fall back to X11 via XWayland
             super::x11_impl::cursor_position()
         }
     }
 
+    fn use_ydotool() -> bool {
+        is_wayland() && ydotool_available()
+    }
+
     #[napi]
-    pub fn mouse_move(x: f64, y: f64) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
-        if is_wayland() && ydotool_available() {
-            wayland_impl::mouse_move(x as i32, y as i32);
+    pub fn mouse_move(x: f64, y: f64) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
+        if use_ydotool() {
+            wayland_impl::mouse_move(x as i32, y as i32)
         } else {
-            x11_impl::mouse_move(x as i32, y as i32);
+            x11_impl::mouse_move(x as i32, y as i32)
         }
     }
 
@@ -333,7 +300,10 @@ mod linux {
         modifiers: &[String],
         which: u8,
     ) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
+        // A release always goes out, even after Stop (7.7.0).
+        if which != 2 {
+            crate::activity::ensure_not_emergency_stopped()?;
+        }
         let btn = x11_button(button)?;
         let keysyms = modifiers
             .iter()
@@ -346,7 +316,14 @@ mod linux {
                 "Button-aware drags are unavailable on Wayland; use X11 or the accessibility tools",
             ));
         }
-        x11_impl::pointer_event(x as i32, y as i32, btn, &keysyms, which);
+        let bit = super::button_bit(button);
+        if which == 2 {
+            AGENT_BUTTONS_HELD.fetch_and(!bit, Ordering::AcqRel);
+        }
+        x11_impl::pointer_event(x as i32, y as i32, btn, &keysyms, which)?;
+        if which == 0 {
+            AGENT_BUTTONS_HELD.fetch_or(bit, Ordering::AcqRel);
+        }
         Ok(())
     }
 
@@ -364,17 +341,19 @@ mod linux {
         };
         if is_wayland() {
             if additive { return Err(napi::Error::from_reason("Additive selection is unavailable on Wayland; use accessibility selection")); }
-            if !ydotool_available() { return Err(napi::Error::from_reason("ydotool is unavailable")); }
-            wayland_impl::mouse_click(x as i32, y as i32, btn, count);
+            if !ydotool_available() {
+                return Err(napi::Error::from_reason(format!(
+                    "ydotool is not installed: {}", crate::linux_tools::install_hint("ydotool")
+                )));
+            }
+            wayland_impl::mouse_click(x as i32, y as i32, btn, count)
         } else {
-            x11_impl::mouse_click(x as i32, y as i32, btn, count, additive);
+            x11_impl::mouse_click(x as i32, y as i32, btn, count, additive)
         }
-        Ok(())
     }
 
     #[napi]
     pub fn mouse_button(action: String, x: f64, y: f64) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
         let press = match action.as_str() {
             "press" => true,
             "release" => false,
@@ -384,44 +363,64 @@ mod linux {
                 )))
             }
         };
-        if is_wayland() && ydotool_available() {
-            wayland_impl::mouse_button(press, x as i32, y as i32);
+        if press {
+            crate::activity::ensure_not_emergency_stopped()?;
         } else {
-            x11_impl::mouse_button(press, x as i32, y as i32);
+            AGENT_BUTTONS_HELD.fetch_and(!1, Ordering::AcqRel);
+        }
+        if use_ydotool() {
+            wayland_impl::mouse_move(x as i32, y as i32)?;
+            wayland_impl::button_event(1, press)?;
+        } else {
+            x11_impl::button_event(1, press, Some((x as i32, y as i32)))?;
+        }
+        if press {
+            AGENT_BUTTONS_HELD.fetch_or(1, Ordering::AcqRel);
         }
         Ok(())
     }
 
-    #[napi]
-    pub fn mouse_scroll(dy: i32, dx: i32) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
-        if is_wayland() && ydotool_available() {
-            wayland_impl::mouse_scroll(dy, dx);
-        } else {
-            x11_impl::mouse_scroll(dy, dx);
+    /// Release every button this process holds (7.7.0: before, Linux released nothing on Stop).
+    pub(crate) fn release_agent_held_buttons() {
+        let held = AGENT_BUTTONS_HELD.swap(0, Ordering::AcqRel);
+        for (bit, btn) in [(1u8, 1u32), (2, 3), (4, 2)] {
+            if held & bit == 0 {
+                continue;
+            }
+            let _ = if use_ydotool() {
+                wayland_impl::button_event(btn, false)
+            } else {
+                x11_impl::button_event(btn, false, None)
+            };
         }
     }
 
     #[napi]
-    pub fn mouse_drag(x: f64, y: f64) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
-        if is_wayland() && ydotool_available() {
-            wayland_impl::mouse_move(x as i32, y as i32);
+    pub fn mouse_scroll(dy: i32, dx: i32) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
+        if use_ydotool() {
+            wayland_impl::mouse_scroll(dy, dx)
         } else {
-            x11_impl::mouse_move(x as i32, y as i32);
+            x11_impl::mouse_scroll(dy, dx)
+        }
+    }
+
+    #[napi]
+    pub fn mouse_drag(x: f64, y: f64) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
+        if use_ydotool() {
+            wayland_impl::mouse_move(x as i32, y as i32)
+        } else {
+            x11_impl::mouse_move(x as i32, y as i32)
         }
     }
 
     #[napi]
     pub fn cursor_position() -> napi::Result<serde_json::Value> {
-        let (rx, ry) = if is_wayland() && ydotool_available() {
-            wayland_impl::cursor_position()
+        let (rx, ry) = if use_ydotool() {
+            wayland_impl::cursor_position()?
         } else {
-            x11_impl::cursor_position()
+            x11_impl::cursor_position()?
         };
         Ok(serde_json::json!({"x": rx, "y": ry}))
     }
@@ -436,9 +435,11 @@ mod macos {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
     use napi_derive::napi;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    static AGENT_LEFT_HELD: AtomicBool = AtomicBool::new(false);
+    /// Buttons this process pressed and has not released (bits: 1 left, 2 right, 4 middle). The emergency latch
+    /// releases every one of them (7.7.0; before, only the left button was tracked).
+    static AGENT_BUTTONS_HELD: AtomicU8 = AtomicU8::new(0);
 
     fn source() -> CGEventSource {
         // Keep synthetic state out of the HID-only physical-user activity
@@ -452,9 +453,8 @@ mod macos {
 
     #[napi]
     pub fn mouse_move(x: f64, y: f64) -> napi::Result<()> {
-        if crate::activity::emergency_stop_active() {
-            return Ok(());
-        }
+        // 7.7.0: a latched move is an error, not a silent success, so a gesture stopped by the chord does not report done.
+        crate::activity::ensure_not_emergency_stopped()?;
         crate::permissions::ensure_input_trusted()?;
         let point = CGPoint::new(x, y);
         let event = CGEvent::new_mouse_event(
@@ -527,7 +527,10 @@ mod macos {
         modifiers: &[String],
         which: u8,
     ) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
+        // A release always goes out, even after Stop: refusing it is what used to leave a button held (7.7.0).
+        if which != 2 {
+            crate::activity::ensure_not_emergency_stopped()?;
+        }
         crate::permissions::ensure_input_trusted()?;
         let (mouse_button, down, up, dragged) = button_events(button)?;
         let flags = modifier_flags(modifiers)?;
@@ -538,12 +541,19 @@ mod macos {
         };
         let event = CGEvent::new_mouse_event(source(), event_type, CGPoint::new(x, y), mouse_button)
             .map_err(|_| napi::Error::from_reason("Could not create mouse event"))?;
-        if flags != CGEventFlags::CGEventFlagNull {
+        // The release carries no modifier flags: a flagged final event can leave the modifier latched in the window
+        // server's state (the class Peekaboo #797 measured).
+        if flags != CGEventFlags::CGEventFlagNull && which != 2 {
             event.set_flags(flags);
+        } else if which == 2 {
+            event.set_flags(CGEventFlags::CGEventFlagNull);
         }
         post(event);
-        if button == "left" {
-            AGENT_LEFT_HELD.store(which == 0, Ordering::Release);
+        let bit = super::button_bit(button);
+        match which {
+            0 => { AGENT_BUTTONS_HELD.fetch_or(bit, Ordering::AcqRel); }
+            2 => { AGENT_BUTTONS_HELD.fetch_and(!bit, Ordering::AcqRel); }
+            _ => {}
         }
         Ok(())
     }
@@ -635,7 +645,8 @@ mod macos {
             down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, i as i64);
             post(down);
             let up = CGEvent::new_mouse_event(source(), up_type, point, btn).unwrap();
-            if additive { up.set_flags(CGEventFlags::CGEventFlagCommand); }
+            // The last up carries no flags, so an additive click never leaves Command latched (7.7.0).
+            if additive && i < count { up.set_flags(CGEventFlags::CGEventFlagCommand); } else { up.set_flags(CGEventFlags::CGEventFlagNull); }
             up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, i as i64);
             post(up);
             if i < count {
@@ -647,9 +658,6 @@ mod macos {
 
     #[napi]
     pub fn mouse_button(action: String, x: f64, y: f64) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
-        crate::permissions::ensure_input_trusted()?;
-        let point = CGPoint::new(x, y);
         let evt_type = match action.as_str() {
             "press" => CGEventType::LeftMouseDown,
             "release" => CGEventType::LeftMouseUp,
@@ -659,35 +667,51 @@ mod macos {
                 )))
             }
         };
+        if action == "press" {
+            crate::activity::ensure_not_emergency_stopped()?;
+        }
+        crate::permissions::ensure_input_trusted()?;
+        let point = CGPoint::new(x, y);
         let event =
             CGEvent::new_mouse_event(source(), evt_type, point, CGMouseButton::Left).unwrap();
+        event.set_flags(CGEventFlags::CGEventFlagNull);
         post(event);
-        AGENT_LEFT_HELD.store(action == "press", Ordering::Release);
+        if action == "press" {
+            AGENT_BUTTONS_HELD.fetch_or(1, Ordering::AcqRel);
+        } else {
+            AGENT_BUTTONS_HELD.fetch_and(!1, Ordering::AcqRel);
+        }
         Ok(())
     }
 
+    /// Release every button this process holds, at the cursor, with no modifier flags. Runs on the emergency latch's
+    /// own thread; posting is not subject to the latch.
     pub(crate) fn release_agent_held_buttons() {
-        if !AGENT_LEFT_HELD.swap(false, Ordering::AcqRel) {
+        let held = AGENT_BUTTONS_HELD.swap(0, Ordering::AcqRel);
+        if held == 0 {
             return;
         }
         let location = CGEvent::new(source())
             .map(|event| event.location())
             .unwrap_or_default();
-        if let Ok(event) = CGEvent::new_mouse_event(
-            source(),
-            CGEventType::LeftMouseUp,
-            location,
-            CGMouseButton::Left,
-        ) {
-            post(event);
+        for (bit, button, up) in [
+            (1u8, CGMouseButton::Left, CGEventType::LeftMouseUp),
+            (2, CGMouseButton::Right, CGEventType::RightMouseUp),
+            (4, CGMouseButton::Center, CGEventType::OtherMouseUp),
+        ] {
+            if held & bit == 0 {
+                continue;
+            }
+            if let Ok(event) = CGEvent::new_mouse_event(source(), up, location, button) {
+                event.set_flags(CGEventFlags::CGEventFlagNull);
+                post(event);
+            }
         }
     }
 
     #[napi]
     pub fn mouse_scroll(dy: i32, dx: i32) -> napi::Result<()> {
-        if crate::activity::emergency_stop_active() {
-            return Ok(());
-        }
+        crate::activity::ensure_not_emergency_stopped()?;
         crate::permissions::ensure_input_trusted()?;
         if let Ok(event) = CGEvent::new_scroll_event(source(), ScrollEventUnit::LINE, 2, dy, dx, 0)
         {
@@ -698,9 +722,7 @@ mod macos {
 
     #[napi]
     pub fn mouse_drag(x: f64, y: f64) -> napi::Result<()> {
-        if crate::activity::emergency_stop_active() {
-            return Ok(());
-        }
+        crate::activity::ensure_not_emergency_stopped()?;
         crate::permissions::ensure_input_trusted()?;
         let point = CGPoint::new(x, y);
         let event = CGEvent::new_mouse_event(
@@ -812,11 +834,13 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod win {
     use napi_derive::napi;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::Duration;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
-    static AGENT_LEFT_HELD: AtomicBool = AtomicBool::new(false);
+    /// Buttons this process pressed and has not released (bits: 1 left, 2 right, 4 middle). 7.7.0: all three, and
+    /// the latch releases every one (before, only the left button was tracked).
+    static AGENT_BUTTONS_HELD: AtomicU8 = AtomicU8::new(0);
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     struct ControlGuard(bool);
@@ -825,25 +849,36 @@ mod win {
             wVk: VK_CONTROL, wScan: 0, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
             time: 0, dwExtraInfo: 0,
         } } };
-        unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32); }
+        let _ = crate::keyboard::send_inputs(&[input]);
     }
     impl Drop for ControlGuard {
         fn drop(&mut self) { if self.0 { control_event(true); } }
     }
 
-    fn screen_size() -> (i32, i32) {
-        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+    /// The virtual desktop (every monitor), in the coordinates input uses.
+    fn virtual_desktop() -> (i32, i32, i32, i32) {
+        unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        }
     }
 
+    /// 7.7.0 (W1): absolute coordinates normalised over the whole virtual desktop and sent with
+    /// `MOUSEEVENTF_VIRTUALDESK`, so a point on a second monitor is reached (before, every point was normalised over
+    /// the primary monitor and clamped to it, one pixel short).
     fn to_absolute(x: f64, y: f64) -> (i32, i32) {
-        let (sw, sh) = screen_size();
-        let ax = ((x * 65535.0) / sw as f64) as i32;
-        let ay = ((y * 65535.0) / sh as f64) as i32;
-        (ax, ay)
+        let (left, top, width, height) = virtual_desktop();
+        (super::normalize_absolute(x, left, width), super::normalize_absolute(y, top, height))
     }
 
-    fn send_mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, data: i32) {
-        let input = INPUT {
+    const ABSOLUTE: MOUSE_EVENT_FLAGS = MOUSE_EVENT_FLAGS(MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
+
+    fn mouse_input(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
+        INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
@@ -855,10 +890,14 @@ mod win {
                     dwExtraInfo: 0,
                 },
             },
-        };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
         }
+    }
+
+    /// Send one mouse event. 7.7.0 (W2): `SendInput` reports how many events it inserted; zero means the input was
+    /// blocked (UIPI: the foreground window belongs to a higher-integrity process, or the secure desktop is up), which
+    /// is now an error instead of a success.
+    fn send_mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, data: i32) -> napi::Result<()> {
+        crate::keyboard::send_inputs(&[mouse_input(dx, dy, flags, data)])
     }
 
     fn button_flags(button: &str) -> napi::Result<(MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS)> {
@@ -900,9 +939,7 @@ mod win {
                 },
             },
         };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
+        let _ = crate::keyboard::send_inputs(&[input]);
     }
     impl ModifierGuard {
         fn hold(modifiers: &[String]) -> napi::Result<Self> {
@@ -931,25 +968,28 @@ mod win {
         modifiers: &[String],
         which: u8,
     ) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
+        // A release always goes out, even after Stop (7.7.0).
+        if which != 2 {
+            crate::activity::ensure_not_emergency_stopped()?;
+        }
         let (down, up) = button_flags(button)?;
         let (ax, ay) = to_absolute(x, y);
+        let bit = super::button_bit(button);
         match which {
             // Press and release hold the modifiers only for their own event; a
             // drag holds them across the whole path from the caller's side.
             0 => {
                 let _guard = ModifierGuard::hold(modifiers)?;
-                send_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
-                send_mouse(ax, ay, down | MOUSEEVENTF_ABSOLUTE, 0);
+                send_mouse(ax, ay, MOUSEEVENTF_MOVE | ABSOLUTE, 0)?;
+                send_mouse(ax, ay, down | ABSOLUTE, 0)?;
+                AGENT_BUTTONS_HELD.fetch_or(bit, Ordering::AcqRel);
             }
-            1 => send_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0),
+            1 => send_mouse(ax, ay, MOUSEEVENTF_MOVE | ABSOLUTE, 0)?,
             _ => {
+                AGENT_BUTTONS_HELD.fetch_and(!bit, Ordering::AcqRel);
                 let _guard = ModifierGuard::hold(modifiers)?;
-                send_mouse(ax, ay, up | MOUSEEVENTF_ABSOLUTE, 0);
+                send_mouse(ax, ay, up | ABSOLUTE, 0)?;
             }
-        }
-        if button == "left" {
-            AGENT_LEFT_HELD.store(which == 0, Ordering::Release);
         }
         Ok(())
     }
@@ -973,12 +1013,10 @@ mod win {
     }
 
     #[napi]
-    pub fn mouse_move(x: f64, y: f64) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
+    pub fn mouse_move(x: f64, y: f64) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
         let (ax, ay) = to_absolute(x, y);
-        send_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+        send_mouse(ax, ay, MOUSEEVENTF_MOVE | ABSOLUTE, 0)
     }
 
     #[napi]
@@ -995,7 +1033,7 @@ mod win {
         crate::activity::ensure_not_emergency_stopped()?;
         let (ax, ay) = to_absolute(x, y);
         // Move first, settle
-        send_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+        send_mouse(ax, ay, MOUSEEVENTF_MOVE | ABSOLUTE, 0)?;
         std::thread::sleep(Duration::from_millis(10));
 
         let (down, up) = match button.as_str() {
@@ -1014,8 +1052,8 @@ mod win {
         if inject_ctrl { control_event(false); }
         for i in 0..count {
             crate::activity::ensure_not_emergency_stopped()?;
-            send_mouse(ax, ay, down | MOUSEEVENTF_ABSOLUTE, 0);
-            send_mouse(ax, ay, up | MOUSEEVENTF_ABSOLUTE, 0);
+            // Down and up in one SendInput call: atomic, so nothing can interleave a click in half.
+            crate::keyboard::send_inputs(&[mouse_input(ax, ay, down | ABSOLUTE, 0), mouse_input(ax, ay, up | ABSOLUTE, 0)])?;
             if i < count - 1 {
                 std::thread::sleep(Duration::from_millis(30));
             }
@@ -1025,8 +1063,6 @@ mod win {
 
     #[napi]
     pub fn mouse_button(action: String, x: f64, y: f64) -> napi::Result<()> {
-        crate::activity::ensure_not_emergency_stopped()?;
-        let (ax, ay) = to_absolute(x, y);
         let flag = match action.as_str() {
             "press" => MOUSEEVENTF_LEFTDOWN,
             "release" => MOUSEEVENTF_LEFTUP,
@@ -1036,39 +1072,49 @@ mod win {
                 )))
             }
         };
-        send_mouse(ax, ay, flag | MOUSEEVENTF_ABSOLUTE, 0);
-        AGENT_LEFT_HELD.store(action == "press", Ordering::Release);
+        if action == "press" {
+            crate::activity::ensure_not_emergency_stopped()?;
+        }
+        let (ax, ay) = to_absolute(x, y);
+        if action == "press" {
+            send_mouse(ax, ay, flag | ABSOLUTE, 0)?;
+            AGENT_BUTTONS_HELD.fetch_or(1, Ordering::AcqRel);
+        } else {
+            AGENT_BUTTONS_HELD.fetch_and(!1, Ordering::AcqRel);
+            send_mouse(ax, ay, flag | ABSOLUTE, 0)?;
+        }
         Ok(())
     }
 
+    /// Release every button this process holds, where the cursor is. Runs on the emergency latch's own thread.
     pub(crate) fn release_agent_held_buttons() {
-        if AGENT_LEFT_HELD.swap(false, Ordering::AcqRel) {
-            send_mouse(0, 0, MOUSEEVENTF_LEFTUP, 0);
+        let held = AGENT_BUTTONS_HELD.swap(0, Ordering::AcqRel);
+        for (bit, up) in [(1u8, MOUSEEVENTF_LEFTUP), (2, MOUSEEVENTF_RIGHTUP), (4, MOUSEEVENTF_MIDDLEUP)] {
+            if held & bit != 0 {
+                let _ = send_mouse(0, 0, up, 0);
+            }
         }
     }
 
     #[napi]
-    pub fn mouse_scroll(dy: i32, dx: i32) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
+    pub fn mouse_scroll(dy: i32, dx: i32) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
         // Vertical scroll
         if dy != 0 {
-            send_mouse(0, 0, MOUSEEVENTF_WHEEL, -dy * 120);
+            send_mouse(0, 0, MOUSEEVENTF_WHEEL, -dy * 120)?;
         }
         // Horizontal scroll
         if dx != 0 {
-            send_mouse(0, 0, MOUSEEVENTF_HWHEEL, dx * 120);
+            send_mouse(0, 0, MOUSEEVENTF_HWHEEL, dx * 120)?;
         }
+        Ok(())
     }
 
     #[napi]
-    pub fn mouse_drag(x: f64, y: f64) {
-        if crate::activity::emergency_stop_active() {
-            return;
-        }
+    pub fn mouse_drag(x: f64, y: f64) -> napi::Result<()> {
+        crate::activity::ensure_not_emergency_stopped()?;
         let (ax, ay) = to_absolute(x, y);
-        send_mouse(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+        send_mouse(ax, ay, MOUSEEVENTF_MOVE | ABSOLUTE, 0)
     }
 
     #[napi]
@@ -1079,6 +1125,68 @@ mod win {
             let _ = GetCursorPos(&mut pt);
         }
         Ok(serde_json::json!({ "x": pt.x, "y": pt.y }))
+    }
+}
+
+/// The held-button bit for a button name (1 left, 2 right, 4 middle); 0 for anything else.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
+pub(crate) fn button_bit(button: &str) -> u8 {
+    match button {
+        "left" => 1,
+        "right" => 2,
+        "middle" => 4,
+        _ => 0,
+    }
+}
+
+/// Map a coordinate onto the 0..=65535 range `SendInput` uses for absolute input over a span of `size` pixels that
+/// starts at `origin` (7.7.0, W1). Rounded, not truncated: the old truncation landed one pixel short (Windows-MCP
+/// #441), and the far edge maps to 65535 exactly.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn normalize_absolute(value: f64, origin: i32, size: i32) -> i32 {
+    if size <= 1 {
+        return 0;
+    }
+    let relative = (value - origin as f64).clamp(0.0, (size - 1) as f64);
+    ((relative * 65535.0) / (size - 1) as f64).round() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{button_bit, normalize_absolute};
+
+    #[test]
+    fn absolute_input_spans_the_virtual_desktop() {
+        // A single 1920-wide monitor: the edges map to 0 and 65535 exactly, the centre to the middle.
+        assert_eq!(normalize_absolute(0.0, 0, 1920), 0);
+        assert_eq!(normalize_absolute(1919.0, 0, 1920), 65535);
+        assert_eq!(normalize_absolute(959.5, 0, 1920), 32768);
+        // Two monitors, the second to the left of the primary (virtual desktop starts at -1920).
+        assert_eq!(normalize_absolute(-1920.0, -1920, 3840), 0);
+        assert_eq!(normalize_absolute(0.0, -1920, 3840), normalize_absolute(1920.0, 0, 3840));
+        assert_eq!(normalize_absolute(1919.0, -1920, 3840), 65535);
+        // Out of range clamps rather than wrapping.
+        assert_eq!(normalize_absolute(-5000.0, 0, 1920), 0);
+        assert_eq!(normalize_absolute(99_999.0, 0, 1920), 65535);
+        assert_eq!(normalize_absolute(10.0, 0, 1), 0);
+    }
+
+    #[test]
+    fn rounding_lands_on_the_pixel_asked_for() {
+        // Windows maps an absolute value v back to pixel floor(v * (size - 1) / 65535 + 0.5) for each pixel.
+        for size in [800, 1366, 1920, 2560, 3840] {
+            for pixel in [0, 1, 2, size / 3, size / 2, size - 2, size - 1] {
+                let v = normalize_absolute(pixel as f64, 0, size) as f64;
+                let back = (v * (size - 1) as f64 / 65535.0).round() as i32;
+                assert_eq!(back, pixel, "size {size} pixel {pixel}");
+            }
+        }
+    }
+
+    #[test]
+    fn button_bits() {
+        assert_eq!(button_bit("left") | button_bit("right") | button_bit("middle"), 7);
+        assert_eq!(button_bit("other"), 0);
     }
 }
 
@@ -1093,4 +1201,6 @@ pub(crate) fn release_agent_held_buttons() {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn release_agent_held_buttons() {}
+pub(crate) fn release_agent_held_buttons() {
+    linux::release_agent_held_buttons();
+}

@@ -223,6 +223,13 @@ export interface NativeModule {
   mouseClickToPid?(pid: number, x: number, y: number, button: string, count: number, windowId?: number): void
   mouseScrollToPid?(pid: number, x: number, y: number, dy: number, dx: number, windowId?: number): void
   holdKey(keys: string[], durationMs: number): void // throws on unknown key
+  /**
+   * 7.7.0: press keys and keep them down until `keyUp` (or the emergency latch) releases them. Every name is resolved
+   * before anything is pressed; an unknown key throws with nothing held. Optional: older native modules lack it.
+   */
+  keyDown?(keys: string[]): void
+  /** 7.7.0: release keys pressed by `keyDown`, in reverse order; `[]` releases everything held. Never refused by the latch. */
+  keyUp?(keys: string[]): void
   // Apps
   activateApp(bundleId: string, timeoutMs?: number): { bundleId: string; activated: boolean; displayName?: string }
   getFrontmostApp(): { bundleId: string; displayName: string; pid: number } | null

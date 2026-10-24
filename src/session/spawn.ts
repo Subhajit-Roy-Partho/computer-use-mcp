@@ -3,6 +3,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from 'child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
@@ -30,6 +31,13 @@ export interface SpawnResult {
 }
 
 const MAX_SUBPROCESS_OUTPUT_BYTES = 8 * 1024 * 1024
+
+/**
+ * How long output may keep arriving after the process exits (7.7.0, K9). A backgrounded grandchild that inherited the
+ * pipes kept them open, and `close` waited for it until the call timed out; now the call completes this long after
+ * `exit` with what was written.
+ */
+export const EXIT_GRACE_MS = 500
 
 export type SpawnBounded = (
   cmd: string,
@@ -125,6 +133,8 @@ export const defaultSpawnBounded: SpawnBounded = (cmd, args, timeoutMs, signal, 
     child.stdin?.end(input)
     let stdout = ''
     let stderr = ''
+    // One decoder per stream, so a multi-byte character split across two chunks is not turned into U+FFFD (W6).
+    const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
     let capturedBytes = 0
     let outputLimitExceeded = false
     let timedOut = false
@@ -140,7 +150,7 @@ export const defaultSpawnBounded: SpawnBounded = (cmd, args, timeoutMs, signal, 
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       const remaining = MAX_SUBPROCESS_OUTPUT_BYTES - capturedBytes
       if (bytes.byteLength > remaining) {
-        const retained = bytes.subarray(0, Math.max(remaining, 0)).toString()
+        const retained = decoders[stream].write(bytes.subarray(0, Math.max(remaining, 0))) + decoders[stream].end()
         if (stream === 'stdout') stdout += retained
         else stderr += retained
         capturedBytes = MAX_SUBPROCESS_OUTPUT_BYTES
@@ -150,8 +160,8 @@ export const defaultSpawnBounded: SpawnBounded = (cmd, args, timeoutMs, signal, 
         return
       }
       capturedBytes += bytes.byteLength
-      if (stream === 'stdout') stdout += bytes.toString()
-      else stderr += bytes.toString()
+      if (stream === 'stdout') stdout += decoders.stdout.write(bytes)
+      else stderr += decoders.stderr.write(bytes)
     }
     child.stdout?.on('data', chunk => { capture('stdout', chunk) })
     child.stderr?.on('data', chunk => { capture('stderr', chunk) })
@@ -165,14 +175,18 @@ export const defaultSpawnBounded: SpawnBounded = (cmd, args, timeoutMs, signal, 
       timedOut = true
       terminate()
     }, Math.max(timeoutMs, 100))
-    child.on('error', err => {
+    let settled = false
+    let grace: ReturnType<typeof setTimeout> | undefined
+    const finish = (code: number | null) => {
+      if (settled) return
+      settled = true
       clearTimeout(killer)
+      if (grace) clearTimeout(grace)
       cleanup()
-      resolve({ stdout, stderr: stderr || String(err), code: -1, timedOut })
-    })
-    child.on('close', code => {
-      clearTimeout(killer)
-      cleanup()
+      if (!outputLimitExceeded) {
+        stdout += decoders.stdout.end()
+        stderr += decoders.stderr.end()
+      }
       resolve({
         stdout,
         stderr: aborted ? (stderr || 'aborted') : stderr,
@@ -181,5 +195,22 @@ export const defaultSpawnBounded: SpawnBounded = (cmd, args, timeoutMs, signal, 
         code: outputLimitExceeded ? -1 : (code ?? -1),
         timedOut,
       })
+    }
+    child.on('error', err => {
+      if (settled) return
+      settled = true
+      clearTimeout(killer)
+      if (grace) clearTimeout(grace)
+      cleanup()
+      resolve({ stdout, stderr: stderr || String(err), code: -1, timedOut })
     })
+    child.on('exit', code => {
+      // Output still buffered in the pipes normally arrives before `close`; a grandchild holding them gets the grace.
+      grace = setTimeout(() => {
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        finish(code)
+      }, EXIT_GRACE_MS)
+    })
+    child.on('close', code => finish(code))
   })

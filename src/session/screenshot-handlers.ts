@@ -1,5 +1,5 @@
 import type { NativeModule } from '../native.js'
-import { errJson, ok, type ToolResult, platformUnsupported } from '../result.js'
+import { errJson, ok, okJson, type ToolResult, platformUnsupported } from '../result.js'
 import { PROVIDER_QUALITY, PROVIDER_WIDTH } from './constants.js'
 import type { TargetStateController } from './target-state.js'
 import type { VirtualPointerController } from './virtual-pointer.js'
@@ -11,6 +11,19 @@ export interface CachedScreenshot {
   data: string
   capturedAt: number
   targetArgs?: Record<string, unknown>
+}
+
+/**
+ * 7.7.0 (K3): how many captures in a row may come back as text when nothing changed. Every turn resends its images,
+ * so an unchanged frame cost 122-187 KB of base64 and about 1,000 image tokens for nothing; the cap re-sends the image
+ * after this many, for a host that dropped the earlier one from context.
+ */
+export const UNCHANGED_TEXT_REPEATS = 3
+
+/** A capture that was cancelled is cancelled: never fall back to a second capture (7.7.0, C7). */
+function abortError(signal: AbortSignal | undefined): Error {
+  const reason = signal?.reason
+  return reason instanceof Error ? reason : new Error('screenshot aborted')
 }
 
 /** Screenshot/zoom handler with cache and pointer projection isolated from dispatch. */
@@ -28,6 +41,8 @@ export class ScreenshotHandler {
   #lastHash: string | undefined
   #lastResult: ToolResult | undefined
   #lastScreenshot: CachedScreenshot | undefined
+  /** Unchanged captures returned as text since the image was last sent (K3). */
+  #unchangedStreak = 0
 
   constructor(options: {
     native: NativeModule
@@ -52,6 +67,40 @@ export class ScreenshotHandler {
 
   /** Why the last ScreenCaptureKit capture fell back to screencapture, if it did. */
   helperFailure(): string | undefined { return this.#helperFailure }
+
+  /**
+   * The reply for a capture identical to the last one sent (K3): text instead of the same image again, up to
+   * `UNCHANGED_TEXT_REPEATS` times in a row; then the image goes out again. `resend: true` or
+   * `COMPUTER_USE_RESEND_UNCHANGED=true` always sends it.
+   */
+  #unchangedReply(args: Record<string, unknown>): ToolResult | undefined {
+    const last = this.#lastResult
+    if (!last) return undefined
+    const resend = args.resend === true || this.#env.COMPUTER_USE_RESEND_UNCHANGED === 'true'
+    if (resend || this.#unchangedStreak >= UNCHANGED_TEXT_REPEATS) {
+      this.#unchangedStreak = 0
+      return last
+    }
+    this.#unchangedStreak++
+    const mapping = last.content.find(block => block.type === 'text')
+    return okJson({
+      unchanged: true,
+      image_omitted: true,
+      hash: this.#lastHash ?? null,
+      since: this.#lastScreenshot ? new Date(this.#lastScreenshot.capturedAt).toISOString() : null,
+      repeats: this.#unchangedStreak,
+      ...(mapping && mapping.type === 'text' ? { mapping: mapping.text } : {}),
+      hint: `Nothing changed since your last screenshot of this target, so the image is not sent again (pass resend: true to get it). `
+        + `Act on what you saw, or use wait_for_stable or wait_for_text instead of polling. `
+        + `After ${UNCHANGED_TEXT_REPEATS} unchanged captures in a row the image is sent again.`,
+    })
+  }
+
+  #sent(result: ToolResult): ToolResult {
+    this.#unchangedStreak = 0
+    this.#lastResult = result
+    return result
+  }
 
   #captureParams(args: Record<string, unknown>): { width: number; quality: number } {
     const provider = typeof args.provider === 'string' ? args.provider : this.#defaultProvider
@@ -87,6 +136,7 @@ export class ScreenshotHandler {
    * failure — takes the synchronous native path in `handle`.
    */
   async handleAsync(tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
+    if ((tool === 'screenshot' || tool === 'zoom') && signal?.aborted) throw abortError(signal)
     try {
       if (tool === 'screenshot' && this.#visionEnabled && this.#helper?.supportsCapture() && args.show_agent_pointer !== true) {
         const result = await this.#sckScreenshot(args, signal)
@@ -99,6 +149,8 @@ export class ScreenshotHandler {
       if (error instanceof WindowSelectionError) return errJson(error.details)
       throw error
     }
+    // C7: a cancelled helper capture must not fall through to the synchronous capture below.
+    if ((tool === 'screenshot' || tool === 'zoom') && signal?.aborted) throw abortError(signal)
     return this.handle(tool, args)
   }
 
@@ -113,12 +165,16 @@ export class ScreenshotHandler {
         windowId, width, format: quality === 0 ? 'png' : 'jpeg', quality: quality === 0 ? 100 : quality,
       }, signal)
     } catch (error) {
+      if (error instanceof HelperFailure && (error.code === 'aborted' || signal?.aborted)) throw abortError(signal)
       if (error instanceof HelperFailure) { this.#helperFailure = `${error.code}: ${error.message}`; return undefined }
       throw error
     }
     this.#helperFailure = undefined
     const scope = JSON.stringify(['sck', windowId, width, quality, bounds])
-    if (scope === this.#lastCaptureScope && capture.hash === this.#lastHash && this.#lastResult) return this.#lastResult
+    if (scope === this.#lastCaptureScope && capture.hash === this.#lastHash && this.#lastResult) {
+      const unchanged = this.#unchangedReply(args)
+      if (unchanged) return unchanged
+    }
     const data = capture.data.toString('base64')
     const frame = bounds ?? capture.frame
     const scale = frame.width / capture.width
@@ -128,7 +184,7 @@ export class ScreenshotHandler {
       mimeType: capture.mimeType, data, capturedAt: this.#now(),
       targetArgs: { target_window_id: windowId, ...(app ? { target_app: app } : {}) },
     }
-    this.#lastResult = {
+    return this.#sent({
       content: [
         { type: 'image', data, mimeType: capture.mimeType },
         { type: 'text', text: [
@@ -138,8 +194,7 @@ export class ScreenshotHandler {
           'the capture is the window alone, without its shadow, so this mapping is exact.',
         ].join('\n') },
       ],
-    }
-    return this.#lastResult
+    })
   }
 
   /**
@@ -175,6 +230,7 @@ export class ScreenshotHandler {
       via = 'window capture'
     } catch (error) {
       if (!(error instanceof HelperFailure)) throw error
+      if (error.code === 'aborted' || signal?.aborted) throw abortError(signal)
       const screen = this.#native.takeScreenshot(undefined, undefined, 0, undefined, undefined)
       if (!screen.base64) throw new Error('Screenshot capture failed')
       const display = this.#native.getDisplaySize()
@@ -278,20 +334,26 @@ export class ScreenshotHandler {
         width, windowId === undefined ? app : undefined, quality,
         showPointer || scope !== this.#lastCaptureScope ? undefined : this.#lastHash, windowId,
       )
-      if (!showPointer && image.unchanged && this.#lastResult) return this.#lastResult
+      if (!showPointer && image.unchanged && this.#lastResult) {
+        const unchanged = this.#unchangedReply(args)
+        if (unchanged) return unchanged
+      }
+      if (!image.base64) {
+        // The native layer skips encoding an unchanged frame; a re-send needs the image itself.
+        image = this.#native.takeScreenshot(width, windowId === undefined ? app : undefined, quality, undefined, windowId)
+      }
       if (!image.base64) throw new Error('Screenshot capture missing image payload')
       if (showPointer) image = this.#pointer.annotateScreenshot(image)
       if (!image.base64) throw new Error('Screenshot capture missing image payload')
       this.#lastCaptureScope = scope
       this.#lastHash = image.hash
       this.#lastScreenshot = { mimeType: image.mimeType, data: image.base64, capturedAt: this.#now(), ...(windowId !== undefined || app ? { targetArgs: { ...(windowId !== undefined ? { target_window_id: windowId } : {}), ...(app ? { target_app: app } : {}) } } : {}) }
-      this.#lastResult = {
+      return this.#sent({
         content: [
           { type: 'image', data: image.base64, mimeType: image.mimeType },
           { type: 'text', text: this.#describeCapture(image.width, image.height, windowId) },
         ],
-      }
-      return this.#lastResult
+      })
     }
     if (tool === 'zoom') {
       const region = args.region

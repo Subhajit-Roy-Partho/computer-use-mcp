@@ -111,6 +111,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
       .describe('AI provider — sets optimal default width. anthropic=1024px, openai=1024px, gemini=768px, deepseek-flash=1280px, qwen/deepseek-vl/phi=896px. Default: auto (1024px).'),
     show_agent_pointer: z.boolean().optional()
       .describe('Render the virtual agent pointer into the returned screenshot without moving the OS cursor.'),
+    resend: z.boolean().optional().describe('Send the image even when nothing changed since the last capture.'),
   }, NONE_READ)
   tool('zoom', 'View a specific region of the screen at full resolution. Useful for reading small text, inspecting UI details, or verifying pixel-level content. Returns the cropped region without downscaling. With target_app or target_window_id the region is in that window\'s points, from its top-left. To read text, read_window_text is cheaper than an image.', {
     region: intArray(4)

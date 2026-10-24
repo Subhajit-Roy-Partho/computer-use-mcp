@@ -24,24 +24,24 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 
 | # | Task | Status | Change | Tested by |
 |---|---|---|---|---|
-| C1 | Releases bypass the stop latch; all three buttons tracked; the latch releases every held button and key; Linux release implemented | todo | | |
-| C2 | `hold_key` validates every key before pressing any; a guard releases on every exit; F13–F20 on Windows and Linux | todo | | |
-| C3 | macOS chords: the final key-up and mouse-up carry no modifier flags | todo | | |
-| C4 | `type` reports an error when the latch stopped it part-way (all platforms) | todo | | |
-| C5 | macOS `type` chunks on character boundaries (no split surrogate pairs) | todo | | |
-| C6 | `hold_key` off the event loop: native press/release primitives, the hold awaited in TypeScript, release in `finally` | todo | | |
-| C7 | A cancelled screenshot rethrows instead of falling through to a second capture | todo | | |
+| C1 | Releases bypass the stop latch; all three buttons tracked; the latch releases every held button and key; Linux release implemented | done | `mouse.rs` `AGENT_BUTTONS_HELD` on macOS, Windows, Linux, releases skip the latch; `keyboard.rs` held-key registry; `activity.rs` latch releases buttons and keys | cargo check (3 targets); Rust unit tests; CI runners |
+| C2 | `hold_key` validates every key before pressing any; a guard releases on every exit; F13–F20 on Windows and Linux | done | `keyboard.rs` `resolve_keys`, `key_down`/`key_up` on all platforms; native `hold_key` releases on every exit; F13–F20 on Windows and Linux | v7.7-stop-cleanup; cargo check (3 targets) |
+| C3 | macOS chords: the final key-up and mouse-up carry no modifier flags | done | `keyboard.rs` final key-up and `type_keys` key-ups carry no flags; `mouse.rs` release and last additive click carry no flags | cargo check; live check in V3 |
+| C4 | `type` reports an error when the latch stopped it part-way (all platforms) | done | `keyboard.rs` `type_text` errors when latched (macOS says how far it got) | cargo check (3 targets) |
+| C5 | macOS `type` chunks on character boundaries (no split surrogate pairs) | done | `keyboard.rs` `utf16_chunks` | Rust keyboard::tests (2) |
+| C6 | `hold_key` off the event loop: native press/release primitives, the hold awaited in TypeScript, release in `finally` | done | native `keyDown`/`keyUp`; `input-handlers.ts` hold awaited with `sleepAbortable`, `keyUp` in `finally` | v7.7-stop-cleanup (4) |
+| C7 | A cancelled screenshot rethrows instead of falling through to a second capture | done | `screenshot-handlers.ts` `abortError`: no fallback capture after a cancel | session-screenshot-handlers (2 new) |
 
 ## W. Windows truth (7.6.2 order 7)
 
 | # | Task | Status | Change | Tested by |
 |---|---|---|---|---|
-| W1 | Absolute input normalised over the virtual desktop (`MOUSEEVENTF_VIRTUALDESK`), rounded | todo | | |
-| W2 | `SendInput` counts checked; blocked input (UIPI) is a typed refusal, not success | todo | | |
+| W1 | Absolute input normalised over the virtual desktop (`MOUSEEVENTF_VIRTUALDESK`), rounded | done | `mouse.rs` `normalize_absolute`, `MOUSEEVENTF_VIRTUALDESK` | Rust mouse::tests (3) |
+| W2 | `SendInput` counts checked; blocked input (UIPI) is a typed refusal, not success | done | `keyboard.rs` `send_inputs`: fewer events inserted than sent is `input_blocked` | cargo check (Windows); CI |
 | W3 | DXGI warm-up frame copied; GDI `BitBlt`/`GetDIBits` results checked | todo | | |
 | W4 | `prepare_display` skips cloaked, tool, owned and shell/input windows; restores exactly the windows it minimised | todo | | |
-| W5 | `multi_edit` newlines as Enter, not Unicode 0x0A | todo | | |
-| W6 | PowerShell output forced to UTF-8; output decoded across chunk boundaries | todo | | |
+| W5 | `multi_edit` newlines as Enter, not Unicode 0x0A | done | `keyboard.rs` Windows `type_text`: `\n` as VK_RETURN, `\r` skipped | cargo check (Windows); CI |
+| W6 | PowerShell output forced to UTF-8; output decoded across chunk boundaries | done | `scripting-service.ts` `POWERSHELL_UTF8_PREFIX`, every Windows script encoded; `spawn.ts` `StringDecoder` per stream | session-scripting-service; v7.7-spawn |
 | W7 | UI Automation through `CUIAutomation8` with 2 s connection and 5 s transaction timeouts | todo | | |
 | W8 | The user-active guard ignores zero-delta mouse moves | todo | | |
 
@@ -66,13 +66,13 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 |---|---|---|---|---|
 | K1 | Result contract at dispatch: `effect`, `route`, `delivery` on every action; `hint` and a safe `next_call` on every refusal and unverified result, from one table; `verify: true` on input tools; instructions describe it | todo | | |
 | K2 | `run_steps` in `desktop`: validate first, activate once, capped waits, stop at the first failure, optional final capture; click aliases listed only in `full` (still callable everywhere); OpenAI adapter scaling fixed | todo | | |
-| K3 | An unchanged capture returns text, not the image, with a streak cap | todo | | |
+| K3 | An unchanged capture returns text, not the image, with a streak cap | done | `screenshot-handlers.ts` `#unchangedReply`, `UNCHANGED_TEXT_REPEATS = 3`; `screenshot.resend` | session (dedup); session-screenshot-handlers (streak cap) |
 | K4 | Slow natives (accessibility walks, activation, captures) run off the event loop; the card is watched, not only polled; Stop latency under 50 ms, tested | todo | | |
 | K5 | A person's control by default: card on by default on macOS; emergency chord armed by default with modifier reconciliation; takeover on deliberate physical input; `screen_locked` and a display-awake assertion; Windows "locked" and "session disconnected" | todo | | |
 | K6 | Windows geometry and capture: per-monitor DPI v2 awareness and one coordinate contract; window capture `PrintWindow` → Windows.Graphics.Capture → crop with an occlusion flag → refusal for minimised; every output; HWND-precise restore | todo | | |
 | K7 | Wayland foundations: portal and GNOME Shell screenshots; a window list that does not need `Shell.Eval`; backends named in `doctor`; a libei design note | todo | | |
 | K8 | macOS capture speed: ScreenCaptureKit display capture replaces `screencapture` + `sips`; `wait_for_text` polls with fast OCR and confirms with accurate; autorelease pools | todo | | |
-| K9 | Carried over: clipboard guard for non-text contents; `run_script` completes on exit plus a grace period; `scrape` refuses private hosts; filesystem search is async and cancellable | todo | | |
+| K9 | Carried over: clipboard guard for non-text contents; `run_script` completes on exit plus a grace period; `scrape` refuses private hosts; filesystem search is async and cancellable | in progress | `spawn.ts` `EXIT_GRACE_MS` (done); clipboard guard, scrape, async search next | v7.7-spawn |
 
 ## V. Release
 

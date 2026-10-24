@@ -74,11 +74,15 @@ fn latch_emergency_stop() {
     if !EMERGENCY_LATCHED.swap(true, Ordering::AcqRel) {
         EMERGENCY_DETECTED_US.store(emergency_monotonic_us(), Ordering::Release);
         EMERGENCY_GENERATION.fetch_add(1, Ordering::AcqRel);
-        // Release only buttons this process deliberately held. Do this off the
-        // OS hook callback so emergency detection never blocks hook delivery.
+        // Release only the buttons and keys this process deliberately held (7.7.0: every button and every key held
+        // with key_down, not just the left button). Do this off the OS hook callback so emergency detection never
+        // blocks hook delivery; releases are never refused by the latch.
         let _ = std::thread::Builder::new()
             .name("computer-use-emergency-release".into())
-            .spawn(crate::mouse::release_agent_held_buttons);
+            .spawn(|| {
+                crate::mouse::release_agent_held_buttons();
+                crate::keyboard::release_agent_held_keys();
+            });
     }
 }
 
@@ -92,6 +96,7 @@ pub(crate) fn ensure_not_emergency_stopped() -> napi::Result<()> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn emergency_stop_active() -> bool {
     EMERGENCY_LATCHED.load(Ordering::Acquire)
 }
