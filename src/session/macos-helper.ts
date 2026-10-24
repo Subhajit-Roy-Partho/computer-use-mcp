@@ -7,9 +7,13 @@
  * so an edited source rebuilds) and signed ad hoc. swiftc ships with Xcode and the
  * Command Line Tools; without it the helper reports itself unavailable and callers
  * fall back (screencapture for captures; OCR has no fallback).
+ *
+ * 7.7.0 (K8): display capture as well as window capture, `--region` crops, and one warm `serve` process instead of a
+ * process per call. Starting the helper cost about 150 ms of every capture; a warm capture takes about 60 ms.
+ * `COMPUTER_USE_HELPER_SERVE=false` goes back to a process per call.
  */
 
-import { execFile, type ExecFileOptions } from 'node:child_process'
+import { execFile, spawn, type ChildProcessWithoutNullStreams, type ExecFileOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeSync } from 'node:fs'
 import { homedir, release, tmpdir } from 'node:os'
@@ -23,14 +27,20 @@ export interface HelperCapture {
   width: number
   height: number
   hash: string
-  /** Image pixels per window point. */
+  /** Image pixels per window (or display) point. */
   scale: number
+  /** The window, or for a display capture the display, in global screen points. */
   frame: HelperFrame
   mimeType: string
   bytes: number
-  /** Set by a helper that cropped the capture to the requested region (window points). */
-  region?: unknown
+  /** Set by a helper that cropped the capture to the requested region (points from the frame's top-left). */
+  region?: HelperFrame
+  window?: number
+  /** The display captured (7.7.0). */
+  display?: number
 }
+
+export type HelperRegion = { x: number; y: number; width: number; height: number }
 
 export interface HelperOcrLine {
   text: string
@@ -54,24 +64,32 @@ export type HelperAvailability = { ok: true; path: string } | { ok: false; reaso
 export interface MacosHelper {
   /** Compile (once) and report whether the helper can run. */
   ensure(signal?: AbortSignal): Promise<HelperAvailability>
-  /** True when window capture goes through ScreenCaptureKit (macOS 14+). */
+  /** True when window and display capture go through ScreenCaptureKit (macOS 14+). */
   supportsCapture(): boolean
+  /** One of `windowId` and `displayId`. */
   capture(options: {
-    windowId: number
+    windowId?: number
+    /** 7.7.0 (K8): a whole display, by id (list_displays) or `main`. */
+    displayId?: number | 'main'
+    /** Display capture: processes whose shielding-level windows (the agent pointer) are left out. */
+    overlayPids?: number[]
+    /** Ignored with `region`, which is cut at full resolution. */
     width?: number
     format?: 'png' | 'jpeg'
     quality?: number
-    /** Crop to this region, in window points from the window's top-left (helper `--region`). */
-    region?: { x: number; y: number; width: number; height: number }
+    /** Crop to this region, in points from the window's or display's top-left (helper `--region`). */
+    region?: HelperRegion
   }, signal?: AbortSignal): Promise<HelperCapture & { data: Buffer }>
   ocr(options: {
     windowId?: number
     imagePath?: string
     /** Window points with windowId; image pixels with imagePath. */
-    region?: { x: number; y: number; width: number; height: number }
+    region?: HelperRegion
     languages?: string[]
     fast?: boolean
   }, signal?: AbortSignal): Promise<HelperOcr>
+  /** Stop the warm helper process, if one is running (7.7.0). */
+  close?(): void
 }
 
 export class HelperFailure extends Error {
@@ -80,6 +98,11 @@ export class HelperFailure extends Error {
     this.name = 'HelperFailure'
   }
 }
+
+/** A warm helper that went away with a call outstanding (7.7.0): the call is asked once more of a fresh one. */
+class HelperExited extends Error {}
+
+type ServeSpawner = (file: string, args: string[]) => ChildProcessWithoutNullStreams
 
 type Runner = (
   file: string, args: string[], options: ExecFileOptions & { signal?: AbortSignal },
@@ -169,6 +192,12 @@ export function createMacosHelper(options: {
   lock?: boolean
   /** How long a call waits for another server's capture to finish before `helper_busy` (default: the call timeout). */
   lockWaitMs?: number
+  /** One warm `serve` process for every call (7.7.0; default true unless COMPUTER_USE_HELPER_SERVE=false). */
+  serve?: boolean
+  spawnServe?: ServeSpawner
+  /** A warm helper with no call for this long is stopped (default 30 s). */
+  serveIdleMs?: number
+  env?: NodeJS.ProcessEnv
 } = {}): MacosHelper {
   const platform = options.platform ?? process.platform
   const sourcePath = options.sourcePath ?? defaultHelperSourcePath()
@@ -247,6 +276,121 @@ export function createMacosHelper(options: {
     return next
   }
 
+  // 7.7.0 (K8): one warm `serve` process answers every call, a JSON line each way. It is stopped after serveIdleMs
+  // without a call and exits by itself when this process goes (its stdin closes). A timeout or a cancel stops it, and
+  // the helper exits after a ScreenCaptureKit stall, so a stuck capture never holds up the next one. Calls stay
+  // serialised and locked as before: the lock is about two captures at once, not about processes.
+  const serveMode = options.serve ?? (options.env ?? process.env).COMPUTER_USE_HELPER_SERVE !== 'false'
+  const spawnServe: ServeSpawner = options.spawnServe ?? ((file, args) => spawn(file, args))
+  const serveIdleMs = options.serveIdleMs ?? 30_000
+  type Waiter = (reply: Record<string, unknown> | Error) => void
+  let warm: { child: ChildProcessWithoutNullStreams; waiters: Map<number, Waiter>; stderr: string } | undefined
+  let nextId = 0
+  let idleTimer: NodeJS.Timeout | undefined
+
+  // A warm helper keeps the event loop alive only while a call is waiting for it.
+  const hold = (child: ChildProcessWithoutNullStreams, on: boolean): void => {
+    for (const handle of [child, child.stdin, child.stdout, child.stderr] as Array<{ ref?(): void; unref?(): void }>) {
+      if (on) handle.ref?.()
+      else handle.unref?.()
+    }
+  }
+  const stopWarm = (): void => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = undefined }
+    const state = warm
+    if (!state) return
+    warm = undefined
+    for (const waiter of state.waiters.values()) waiter(new HelperFailure('aborted', 'the helper was stopped'))
+    state.waiters.clear()
+    try { state.child.stdin.end() } catch { /* already closed */ }
+    try { state.child.kill() } catch { /* already gone */ }
+  }
+  const startWarm = (path: string): NonNullable<typeof warm> => {
+    const child = spawnServe(path, ['serve', '--idle-ms', String(serveIdleMs * 2)])
+    const state = { child, waiters: new Map<number, Waiter>(), stderr: '' }
+    let buffer = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk
+      for (let end = buffer.indexOf('\n'); end >= 0; end = buffer.indexOf('\n')) {
+        const line = buffer.slice(0, end).trim()
+        buffer = buffer.slice(end + 1)
+        let reply: Record<string, unknown> | null = null
+        try { reply = JSON.parse(line) as Record<string, unknown> | null } catch { /* not a reply */ }
+        const waiter = typeof reply?.id === 'number' ? state.waiters.get(reply.id) : undefined
+        if (reply && waiter) waiter(reply)
+      }
+    })
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk: string) => { state.stderr = (state.stderr + chunk).slice(-400) })
+    const gone = (why: string): void => {
+      if (warm === state) warm = undefined
+      const detail = state.stderr.trim()
+      for (const waiter of state.waiters.values()) waiter(new HelperExited(detail ? `${why}: ${detail}` : why))
+      state.waiters.clear()
+    }
+    child.on('exit', (code, signal) => gone(`the helper exited (${signal ?? `code ${code}`}) before replying`))
+    child.on('error', error => gone(`the helper could not run: ${error.message}`))
+    child.stdin.on('error', () => { /* EPIPE; the exit reports it */ })
+    hold(child, false)
+    warm = state
+    return state
+  }
+  const serveCall = (path: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new HelperFailure('aborted', 'helper call aborted')); return }
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = undefined }
+    const state = warm ?? startWarm(path)
+    const id = ++nextId
+    let settled = false
+    // A cancelled or timed-out capture would still finish in the helper after its lock was released, so the helper
+    // is stopped with it, as the one-shot process was.
+    const timer = setTimeout(() => {
+      finish(new HelperFailure('helper_timeout', `helper timed out after ${callTimeoutMs} ms and was stopped`))
+      stopWarm()
+    }, callTimeoutMs)
+    const finish = (reply: Record<string, unknown> | Error): void => {
+      if (settled) return
+      settled = true
+      state.waiters.delete(id)
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      if (warm === state && state.waiters.size === 0) {
+        hold(state.child, false)
+        idleTimer = setTimeout(stopWarm, serveIdleMs)
+        idleTimer.unref()
+      }
+      if (reply instanceof Error) reject(reply)
+      else resolve(reply)
+    }
+    const onAbort = (): void => { finish(new HelperFailure('aborted', 'helper call aborted')); stopWarm() }
+    state.waiters.set(id, finish)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    hold(state.child, true)
+    state.child.stdin.write(`${JSON.stringify({ id, args })}\n`)
+  })
+  // Every helper command only reads, so a call whose helper died under it (its idle exit raced the call, or a crash)
+  // is asked once more of a fresh process.
+  const serveRetrying = async (path: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> => {
+    try { return await serveCall(path, args, signal) } catch (error) {
+      if (!(error instanceof HelperExited)) throw error
+    }
+    try { return await serveCall(path, args, signal) } catch (error) {
+      throw error instanceof HelperExited ? new HelperFailure('helper_failed', error.message.slice(0, 400)) : error
+    }
+  }
+
+  const oneShot = async (path: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> => {
+    const result = await run(path, args, { timeout: callTimeoutMs, signal })
+    let parsed: Record<string, unknown> | undefined
+    try { parsed = JSON.parse(result.stdout.trim().split('\n').pop() ?? '') as Record<string, unknown> } catch { /* below */ }
+    if (!parsed) {
+      if (signal?.aborted) throw new HelperFailure('aborted', 'helper call aborted')
+      const detail = (result.stderr || result.stdout || `exit ${result.code}`).trim().slice(0, 400)
+      throw new HelperFailure(/timed out/.test(detail) ? 'helper_timeout' : 'helper_failed', detail)
+    }
+    return parsed
+  }
+
   const call = (args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> => serialised(async () => {
     const availability = await ensure(signal)
     if (!availability.ok) throw new HelperFailure('helper_unavailable', `${availability.reason}. ${availability.remediation}`)
@@ -254,18 +398,11 @@ export function createMacosHelper(options: {
       try { mkdirSync(cacheDir, { recursive: true }) } catch { /* exists */ }
       await acquireLock(signal)
     }
-    let result
+    let parsed: Record<string, unknown>
     try {
-      result = await run(availability.path, args, { timeout: callTimeoutMs, signal })
+      parsed = serveMode ? await serveRetrying(availability.path, args, signal) : await oneShot(availability.path, args, signal)
     } finally {
       if (useLock) releaseLock()
-    }
-    let parsed: Record<string, unknown> | undefined
-    try { parsed = JSON.parse(result.stdout.trim().split('\n').pop() ?? '') as Record<string, unknown> } catch { /* below */ }
-    if (!parsed) {
-      if (signal?.aborted) throw new HelperFailure('aborted', 'helper call aborted')
-      const detail = (result.stderr || result.stdout || `exit ${result.code}`).trim().slice(0, 400)
-      throw new HelperFailure(/timed out/.test(detail) ? 'helper_timeout' : 'helper_failed', detail)
     }
     if (typeof parsed.error === 'string') throw new HelperFailure(parsed.error, String(parsed.message ?? parsed.error))
     return parsed
@@ -274,10 +411,20 @@ export function createMacosHelper(options: {
   return {
     ensure,
     supportsCapture: () => sck,
-    async capture({ windowId, width, format = 'jpeg', quality = 80, region }, signal) {
-      if (!sck) throw new HelperFailure('sck_unavailable', 'ScreenCaptureKit window capture needs macOS 14 or later')
+    close: stopWarm,
+    async capture({ windowId, displayId, overlayPids, width, format = 'jpeg', quality = 80, region }, signal) {
+      if (!sck) throw new HelperFailure('sck_unavailable', 'ScreenCaptureKit capture needs macOS 14 or later')
       const out = join(tmpdir(), `cu-mcp-sck-${process.pid}-${randomBytes(6).toString('hex')}.${format === 'png' ? 'png' : 'jpg'}`)
-      const args = ['capture', '--window', String(windowId), '--out', out, '--format', format, '--quality', String(quality)]
+      const args = ['capture']
+      if (displayId !== undefined) {
+        args.push('--display', String(displayId))
+        if (overlayPids?.length) args.push('--overlay-pids', overlayPids.join(','))
+      } else if (windowId !== undefined) {
+        args.push('--window', String(windowId))
+      } else {
+        throw new HelperFailure('usage', 'capture needs a window or a display')
+      }
+      args.push('--out', out, '--format', format, '--quality', String(quality))
       if (width) args.push('--width', String(Math.round(width)))
       if (region) args.push('--region', [region.x, region.y, region.width, region.height].join(','))
       try {

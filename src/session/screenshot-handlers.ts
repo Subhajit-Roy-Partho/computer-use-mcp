@@ -40,6 +40,15 @@ const CAPTURE_METHODS: Readonly<Record<string, string>> = {
   screen: 'desktop duplication',
 }
 
+/** zoom's `region` as [x1, y1, x2, y2], checked. */
+function zoomRegion(args: Record<string, unknown>): [number, number, number, number] {
+  const region = args.region
+  if (!Array.isArray(region) || region.length !== 4) throw new Error('zoom requires region: [x1, y1, x2, y2]')
+  const [x1, y1, x2, y2] = region as [number, number, number, number]
+  if (x1 >= x2 || y1 >= y2) throw new Error(`Invalid region: x1(${x1}) must be < x2(${x2}), y1(${y1}) must be < y2(${y2})`)
+  return [x1, y1, x2, y2]
+}
+
 /** A capture that was cancelled is cancelled: never fall back to a second capture (7.7.0, C7). */
 function abortError(signal: AbortSignal | undefined): Error {
   const reason = signal?.reason
@@ -153,7 +162,8 @@ export class ScreenshotHandler {
    * v7.5 entry point used by the session. A window capture goes through the
    * ScreenCaptureKit helper when it is available: the window alone (even covered,
    * never activated), without its shadow, so the image-to-screen mapping is exact.
-   * Anything else — full screen, the agent pointer overlay, no helper, a helper
+   * 7.7.0 (K8): so do full-screen captures and zooms, in place of `screencapture` and `sips`.
+   * Anything else — the agent pointer drawn into the image, no helper, a helper
    * failure — takes the native path in `handle` (on a worker thread when the native module can, 7.7.0 K4).
    */
   async handleAsync(tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
@@ -166,6 +176,10 @@ export class ScreenshotHandler {
       if (tool === 'zoom' && (typeof args.target_window_id === 'number' || typeof args.target_app === 'string')) {
         return await this.#zoomWindow(args, signal)
       }
+      if (tool === 'zoom' && this.#helper?.supportsCapture()) {
+        const result = await this.#zoomDisplay(args, signal)
+        if (result) return result
+      }
     } catch (error) {
       if (error instanceof WindowSelectionError) return errJson(error.details)
       throw error
@@ -175,22 +189,34 @@ export class ScreenshotHandler {
     return this.handle(tool, args)
   }
 
-  async #sckScreenshot(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
-    const { windowId, app } = this.#captureWindow(args)
-    if (windowId === undefined) return undefined
-    const { width, quality } = this.#captureParams(args)
-    const bounds = this.#native.getWindow?.(windowId)?.bounds
-    let capture
+  /**
+   * A helper capture, or undefined (the reason kept for doctor) when the native path should take over. A failure
+   * whose code is in `final` is rethrown: the native path would answer a different question (another display, the
+   * whole screen for a region outside it).
+   */
+  async #helperCapture(options: Parameters<MacosHelper['capture']>[0], signal?: AbortSignal, final: readonly string[] = []) {
     try {
-      capture = await this.#helper!.capture({
-        windowId, width, format: quality === 0 ? 'png' : 'jpeg', quality: quality === 0 ? 100 : quality,
-      }, signal)
+      const capture = await this.#helper!.capture(options, signal)
+      this.#helperFailure = undefined
+      return capture
     } catch (error) {
       if (error instanceof HelperFailure && (error.code === 'aborted' || signal?.aborted)) throw abortError(signal)
+      if (error instanceof HelperFailure && final.includes(error.code)) throw error
       if (error instanceof HelperFailure) { this.#helperFailure = `${error.code}: ${error.message}`; return undefined }
       throw error
     }
-    this.#helperFailure = undefined
+  }
+
+  async #sckScreenshot(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
+    const { windowId, app } = this.#captureWindow(args)
+    // An app with no window to capture takes the native path, which says so.
+    if (windowId === undefined) return app === undefined ? this.#sckDisplayScreenshot(args, signal) : undefined
+    const { width, quality } = this.#captureParams(args)
+    const bounds = this.#native.getWindow?.(windowId)?.bounds
+    const capture = await this.#helperCapture({
+      windowId, width, format: quality === 0 ? 'png' : 'jpeg', quality: quality === 0 ? 100 : quality,
+    }, signal)
+    if (!capture) return undefined
     const scope = JSON.stringify(['sck', windowId, width, quality, bounds])
     if (scope === this.#lastCaptureScope && capture.hash === this.#lastHash && this.#lastResult) {
       const unchanged = this.#unchangedReply(args)
@@ -220,52 +246,120 @@ export class ScreenshotHandler {
   }
 
   /**
+   * 7.7.0 (K8): a whole display through ScreenCaptureKit, in place of `screencapture` and up to two `sips` runs, each
+   * a child process the call waited on. The status card and this server's agent pointer overlay are left out, and
+   * `display_id` is honoured (the screencapture path always took the main display).
+   */
+  async #sckDisplayScreenshot(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
+    const { width, quality } = this.#captureParams(args)
+    const displayId = typeof args.display_id === 'number' ? args.display_id : 'main'
+    let capture
+    try {
+      capture = await this.#helperCapture({
+        displayId, overlayPids: [process.pid], width, format: quality === 0 ? 'png' : 'jpeg', quality: quality === 0 ? 100 : quality,
+      }, signal, ['display_not_found'])
+    } catch (error) {
+      if (!(error instanceof HelperFailure)) throw error
+      return errJson({ error: 'display_not_found', display_id: displayId, remediation: ['list_displays gives each display\'s displayId.'] })
+    }
+    if (!capture) return undefined
+    const frame = capture.frame
+    const scope = JSON.stringify(['sck-display', capture.display ?? displayId, width, quality, frame])
+    if (scope === this.#lastCaptureScope && capture.hash === this.#lastHash && this.#lastResult) {
+      const unchanged = this.#unchangedReply(args)
+      if (unchanged) return unchanged
+    }
+    const data = capture.data.toString('base64')
+    const scaleX = frame.width / capture.width
+    const scaleY = frame.height / capture.height
+    this.#lastMapping = { originX: frame.x, originY: frame.y, scaleX, scaleY, imageWidth: capture.width, imageHeight: capture.height }
+    this.#lastCaptureScope = scope
+    this.#lastHash = capture.hash
+    this.#lastScreenshot = { mimeType: capture.mimeType, data, capturedAt: this.#now() }
+    return this.#sent({
+      content: [
+        { type: 'image', data, mimeType: capture.mimeType },
+        { type: 'text', text: [
+          `${capture.width}x${capture.height} | screen: display ${capture.display ?? displayId} at ${frame.x},${frame.y} sized ${frame.width}x${frame.height} (ScreenCaptureKit)`,
+          `screen_x = ${frame.x} + image_x * ${scaleX.toFixed(4)}`,
+          `screen_y = ${frame.y} + image_y * ${scaleY.toFixed(4)}`,
+          'a display capture scales uniformly, so this mapping is exact.',
+        ].join('\n') },
+      ],
+    })
+  }
+
+  /**
+   * 7.7.0 (K8): zoom without a target, cut from the main display at full resolution by ScreenCaptureKit. The region is
+   * in screen points, the space of click (the screencapture path read it as image pixels, which on a Retina display
+   * are twice as many).
+   */
+  async #zoomDisplay(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
+    const [x1, y1, x2, y2] = zoomRegion(args)
+    const outputQuality = typeof args.quality === 'number' ? args.quality : 0
+    let capture
+    try {
+      capture = await this.#helperCapture({
+        displayId: 'main', overlayPids: [process.pid], region: { x: x1, y: y1, width: x2 - x1, height: y2 - y1 },
+        format: outputQuality === 0 ? 'png' : 'jpeg', quality: outputQuality === 0 ? 100 : outputQuality,
+      }, signal, ['invalid_region'])
+    } catch (error) {
+      if (!(error instanceof HelperFailure)) throw error
+      return errJson({ error: 'invalid_region', region: [x1, y1, x2, y2], message: error.message })
+    }
+    if (!capture) return undefined
+    return { content: [
+      { type: 'image', data: capture.data.toString('base64'), mimeType: capture.mimeType },
+      { type: 'text', text: `${capture.width}x${capture.height} (zoomed from display ${capture.display ?? 'main'} at full resolution; region ${x1},${y1}-${x2},${y2} in screen points)` },
+    ] }
+  }
+
+  /**
    * zoom with target_window_id / target_app: `region` is in the window's points
-   * ([x1, y1, x2, y2] from its top-left), cropped from a full-resolution capture of
-   * the window (ScreenCaptureKit), or from a screen capture offset by the window's
-   * position when the helper is unavailable.
+   * ([x1, y1, x2, y2] from its top-left), cut at full resolution from a capture of
+   * the window (ScreenCaptureKit; 7.7.0: the helper crops, so only the region is encoded),
+   * or from a screen capture offset by the window's position when the helper is unavailable.
    */
   async #zoomWindow(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
-    const region = args.region
-    if (!Array.isArray(region) || region.length !== 4) throw new Error('zoom requires region: [x1, y1, x2, y2]')
-    const [x1, y1, x2, y2] = region as [number, number, number, number]
-    if (x1 >= x2 || y1 >= y2) throw new Error(`Invalid region: x1(${x1}) must be < x2(${x2}), y1(${y1}) must be < y2(${y2})`)
+    const [x1, y1, x2, y2] = zoomRegion(args)
     const { windowId } = this.#captureWindow(args)
     if (windowId === undefined) {
       return errJson({ error: 'window_not_found', target_app: args.target_app ?? null, target_window_id: args.target_window_id ?? null })
     }
     const window = this.#native.getWindow?.(windowId)
     if (!window) return errJson({ error: 'window_not_found', target_window_id: windowId })
+    const outputQuality = typeof args.quality === 'number' ? args.quality : 0
+    if (this.#helper?.supportsCapture()) {
+      let capture
+      try {
+        capture = await this.#helperCapture({
+          windowId, region: { x: x1, y: y1, width: x2 - x1, height: y2 - y1 },
+          format: outputQuality === 0 ? 'png' : 'jpeg', quality: outputQuality === 0 ? 100 : outputQuality,
+        }, signal, ['invalid_region'])
+      } catch (error) {
+        if (!(error instanceof HelperFailure)) throw error
+        return errJson({ error: 'invalid_region', region: [x1, y1, x2, y2], window: { windowId, bounds: window.bounds }, message: error.message })
+      }
+      if (capture) {
+        return { content: [
+          { type: 'image', data: capture.data.toString('base64'), mimeType: capture.mimeType },
+          { type: 'text', text: `${capture.width}x${capture.height} (window ${windowId} region ${x1},${y1}-${x2},${y2} in window points, zoomed from a window capture at full resolution)` },
+        ] }
+      }
+    }
     if (typeof this.#native.cropImage !== 'function') {
       return platformUnsupported('zoom', 'platforms whose native module provides cropImage', 'Take a screenshot of the window instead.')
     }
-    const outputQuality = typeof args.quality === 'number' ? args.quality : 0
-    let source: { base64: string; width: number; height: number }
-    let crop: [number, number, number, number]
-    let via: string
-    try {
-      if (!this.#helper?.supportsCapture()) throw new HelperFailure('sck_unavailable', 'no ScreenCaptureKit helper')
-      const capture = await this.#helper.capture({ windowId, format: 'png' }, signal)
-      const s = capture.width / window.bounds.width
-      source = { base64: capture.data.toString('base64'), width: capture.width, height: capture.height }
-      crop = [x1 * s, y1 * s, x2 * s, y2 * s]
-      via = 'window capture'
-    } catch (error) {
-      if (!(error instanceof HelperFailure)) throw error
-      if (error.code === 'aborted' || signal?.aborted) throw abortError(signal)
-      const screen = await offThread(this.#native, 'takeScreenshot', undefined, undefined, 0, undefined, undefined)
-      if (!screen.base64) throw new Error('Screenshot capture failed')
-      const display = this.#native.getDisplaySize()
-      const s = screen.width / display.width
-      source = { base64: screen.base64, width: screen.width, height: screen.height }
-      crop = [(window.bounds.x + x1) * s, (window.bounds.y + y1) * s, (window.bounds.x + x2) * s, (window.bounds.y + y2) * s]
-      via = 'screen capture'
-    }
+    const screen = await offThread(this.#native, 'takeScreenshot', undefined, undefined, 0, undefined, undefined)
+    if (!screen.base64) throw new Error('Screenshot capture failed')
+    const display = this.#native.getDisplaySize()
+    const s = screen.width / display.width
+    const crop = [(window.bounds.x + x1) * s, (window.bounds.y + y1) * s, (window.bounds.x + x2) * s, (window.bounds.y + y2) * s]
     const [cx1, cy1, cx2, cy2] = crop.map(Math.round) as [number, number, number, number]
-    const cropped = this.#native.cropImage(source.base64, cx1, cy1, Math.min(cx2, source.width), Math.min(cy2, source.height), outputQuality)
+    const cropped = this.#native.cropImage(screen.base64, cx1, cy1, Math.min(cx2, screen.width), Math.min(cy2, screen.height), outputQuality)
     return { content: [
       { type: 'image', data: cropped.base64, mimeType: cropped.mimeType },
-      { type: 'text', text: `${cropped.width}x${cropped.height} (window ${windowId} region ${x1},${y1}-${x2},${y2} in window points, zoomed from a ${source.width}x${source.height} ${via})` },
+      { type: 'text', text: `${cropped.width}x${cropped.height} (window ${windowId} region ${x1},${y1}-${x2},${y2} in window points, zoomed from a ${screen.width}x${screen.height} screen capture)` },
     ] }
   }
 
@@ -401,14 +495,7 @@ export class ScreenshotHandler {
       })
     }
     if (tool === 'zoom') {
-      const region = args.region
-      if (!Array.isArray(region) || region.length !== 4) {
-        throw new Error('zoom requires region: [x1, y1, x2, y2]')
-      }
-      const [x1, y1, x2, y2] = region as [number, number, number, number]
-      if (x1 >= x2 || y1 >= y2) {
-        throw new Error(`Invalid region: x1(${x1}) must be < x2(${x2}), y1(${y1}) must be < y2(${y2})`)
-      }
+      const [x1, y1, x2, y2] = zoomRegion(args)
       const source = await offThread(this.#native, 'takeScreenshot', undefined, undefined, 0, undefined, undefined)
       if (!source.base64) throw new Error('Screenshot capture failed')
       // A missing native export used to surface as `cropImage is not a function`, a
