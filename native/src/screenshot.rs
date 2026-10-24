@@ -759,293 +759,7 @@ mod win {
     use napi_derive::napi;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::sync::Mutex;
-    use windows::core::Interface;
-    use windows::Win32::Foundation::*;
-    use windows::Win32::Graphics::Direct3D::*;
-    use windows::Win32::Graphics::Direct3D11::*;
-    use windows::Win32::Graphics::Dxgi::Common::*;
-    use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::Graphics::Gdi::*;
-    use windows::Win32::UI::WindowsAndMessaging::*;
-
-    // ── Cached DXGI resources ────────────────────────────────────────────
-
-    struct DxgiCapture {
-        context: ID3D11DeviceContext,
-        duplication: IDXGIOutputDuplication,
-        staging: ID3D11Texture2D,
-        staging_res: ID3D11Resource,
-        width: u32,
-        height: u32,
-    }
-
-    // Safety: COM pointers are thread-safe when used from the creating thread.
-    // NAPI calls always come from the main JS thread.
-    unsafe impl Send for DxgiCapture {}
-
-    static DXGI_CACHE: Mutex<Option<DxgiCapture>> = Mutex::new(None);
-
-    fn init_dxgi() -> Result<DxgiCapture, String> {
-        unsafe {
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-            .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
-            let device = device.ok_or("No D3D11 device")?;
-            let context = context.ok_or("No D3D11 context")?;
-
-            let dxgi_device: IDXGIDevice =
-                device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
-            let adapter: IDXGIAdapter = dxgi_device
-                .GetParent()
-                .map_err(|e| format!("adapter: {e}"))?;
-            let output: IDXGIOutput = adapter
-                .EnumOutputs(0)
-                .map_err(|e| format!("EnumOutputs: {e}"))?;
-            let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("IDXGIOutput1: {e}"))?;
-            let duplication = output1
-                .DuplicateOutput(&device)
-                .map_err(|e| format!("DuplicateOutput: {e}"))?;
-
-            let desc = duplication.GetDesc();
-            let w = desc.ModeDesc.Width;
-            let h = desc.ModeDesc.Height;
-
-            // Pre-create staging texture
-            let tex_desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut staging: Option<ID3D11Texture2D> = None;
-            device
-                .CreateTexture2D(&tex_desc, None, Some(&mut staging))
-                .map_err(|e| format!("staging texture: {e}"))?;
-            let staging = staging.ok_or("staging None")?;
-            let staging_res: ID3D11Resource = staging
-                .cast()
-                .map_err(|e| format!("staging resource: {e}"))?;
-
-            // Warm up: acquire+release one frame so subsequent calls are fast
-            let mut fi = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut res: Option<IDXGIResource> = None;
-            for _ in 0..5 {
-                match duplication.AcquireNextFrame(200, &mut fi, &mut res) {
-                    Ok(()) => {
-                        let _ = duplication.ReleaseFrame();
-                        break;
-                    }
-                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
-                    Err(_) => break,
-                }
-            }
-
-            Ok(DxgiCapture {
-                context,
-                duplication,
-                staging,
-                staging_res,
-                width: w,
-                height: h,
-            })
-        }
-    }
-
-    fn capture_screen_dxgi() -> Result<(Vec<u8>, u32, u32), String> {
-        let mut cache = DXGI_CACHE.lock().map_err(|e| format!("lock: {e}"))?;
-
-        // Init on first call
-        if cache.is_none() {
-            *cache = Some(init_dxgi()?);
-        }
-        let cap = cache.as_ref().unwrap();
-
-        unsafe {
-            let mut fi = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource: Option<IDXGIResource> = None;
-
-            // Always acquire a fresh frame. Use 100ms timeout to ensure we get
-            // a real frame, not a stale warmup. DXGI delivers frames at vsync
-            // (~16ms at 60Hz), so 100ms is plenty.
-            let mut got_new_frame = false;
-            for _ in 0..3 {
-                match cap
-                    .duplication
-                    .AcquireNextFrame(100, &mut fi, &mut resource)
-                {
-                    Ok(()) => {
-                        got_new_frame = true;
-                        break;
-                    }
-                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
-                    Err(e) => {
-                        *cache = None;
-                        return Err(format!("AcquireNextFrame: {e}"));
-                    }
-                }
-            }
-
-            if got_new_frame {
-                if let Some(ref res) = resource {
-                    let texture: ID3D11Texture2D =
-                        res.cast().map_err(|e| format!("Texture2D: {e}"))?;
-                    let tex_res: ID3D11Resource =
-                        texture.cast().map_err(|e| format!("tex resource: {e}"))?;
-                    cap.context.CopyResource(&cap.staging_res, &tex_res);
-                }
-                let _ = cap.duplication.ReleaseFrame();
-            }
-
-            // Map the staging texture (always has the latest frame)
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            cap.context
-                .Map(&cap.staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| format!("Map: {e}"))?;
-
-            let row_pitch = mapped.RowPitch as usize;
-            let w = cap.width;
-            let h = cap.height;
-            let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-            let src = mapped.pData as *const u8;
-            for y in 0..h as usize {
-                let row = std::slice::from_raw_parts(src.add(y * row_pitch), w as usize * 4);
-                pixels.extend_from_slice(row);
-            }
-
-            cap.context.Unmap(&cap.staging_res, 0);
-
-            Ok((pixels, w, h))
-        }
-    }
-
-    // ── GDI BitBlt (fallback) ────────────────────────────────────────────
-
-    fn capture_screen_gdi() -> napi::Result<(Vec<u8>, u32, u32)> {
-        unsafe {
-            let hdc_screen = GetDC(None);
-            if hdc_screen.is_invalid() {
-                return Err(napi::Error::from_reason("GetDC failed"));
-            }
-            let w = GetSystemMetrics(SM_CXSCREEN) as u32;
-            let h = GetSystemMetrics(SM_CYSCREEN) as u32;
-
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
-            let hbm = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
-            let old = SelectObject(hdc_mem, hbm);
-
-            let _ = BitBlt(hdc_mem, 0, 0, w as i32, h as i32, hdc_screen, 0, 0, SRCCOPY);
-
-            let mut bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(h as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: 0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            GetDIBits(
-                hdc_mem,
-                hbm,
-                0,
-                h,
-                Some(pixels.as_mut_ptr() as *mut _),
-                &mut bmi,
-                DIB_RGB_COLORS,
-            );
-
-            SelectObject(hdc_mem, old);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-
-            Ok((pixels, w, h))
-        }
-    }
-
-    /// Capture screen: try DXGI first, fall back to GDI.
-    fn capture_screen() -> napi::Result<(Vec<u8>, u32, u32)> {
-        match capture_screen_dxgi() {
-            Ok(result) => Ok(result),
-            Err(_) => capture_screen_gdi(),
-        }
-    }
-
-    /// Capture a specific window via GDI BitBlt.
-    fn capture_window(hwnd_val: u32) -> napi::Result<(Vec<u8>, u32, u32)> {
-        unsafe {
-            let hwnd = HWND(hwnd_val as *mut _);
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-            let w = (rect.right - rect.left).max(1) as u32;
-            let h = (rect.bottom - rect.top).max(1) as u32;
-
-            let hdc_win = GetDC(hwnd);
-            if hdc_win.is_invalid() {
-                return Err(napi::Error::from_reason("GetDC for window failed"));
-            }
-            let hdc_mem = CreateCompatibleDC(hdc_win);
-            let hbm = CreateCompatibleBitmap(hdc_win, w as i32, h as i32);
-            let old = SelectObject(hdc_mem, hbm);
-
-            let _ = BitBlt(hdc_mem, 0, 0, w as i32, h as i32, hdc_win, 0, 0, SRCCOPY);
-
-            let mut bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(h as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: 0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            GetDIBits(
-                hdc_mem,
-                hbm,
-                0,
-                h,
-                Some(pixels.as_mut_ptr() as *mut _),
-                &mut bmi,
-                DIB_RGB_COLORS,
-            );
-
-            SelectObject(hdc_mem, old);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_win);
-
-            Ok((pixels, w, h))
-        }
-    }
+    use windows::Win32::Graphics::Gdi::HMONITOR;
 
     /// Resize BGRA pixels using area averaging (box filter) — better quality than
     /// nearest-neighbor and faster for large downscale ratios because it reads
@@ -1135,27 +849,34 @@ mod win {
         Ok(buf.into_inner())
     }
 
+    /// Capture a window (the ladder in `capture_win`) or a monitor (`display_id`, default the primary), scale it to
+    /// `width`, encode it. 7.7.0: the reply names the capture method, whether a screen crop was covered, and the
+    /// captured rectangle in screen coordinates, so the image-to-screen mapping never has to be guessed.
     #[napi]
     pub fn take_screenshot(
         width: Option<u32>,
-        target_app: Option<String>,
+        _target_app: Option<String>,
         quality: Option<u32>,
         previous_hash: Option<String>,
         window_id: Option<u32>,
+        display_id: Option<u32>,
     ) -> napi::Result<serde_json::Value> {
-        let (pixels, mut w, mut h) = if let Some(wid) = window_id {
-            capture_window(wid)?
-        } else if target_app.is_some() {
-            capture_screen()?
+        let (frame, method, occluded) = if let Some(wid) = window_id {
+            let captured = crate::capture_win::capture_window(wid)?;
+            (captured.frame, captured.method, captured.occluded)
         } else {
-            capture_screen()?
+            let monitor = display_id.map(|id| HMONITOR(id as usize as *mut _));
+            (crate::capture_win::capture_monitor(monitor)?, "screen", false)
         };
+        let (left, top) = (frame.left, frame.top);
+        let (source_w, source_h) = (frame.width, frame.height);
+        let (pixels, mut w, mut h) = (frame.bgra, frame.width, frame.height);
 
         // Optimization: resize on BGRA (4-byte aligned) THEN convert to RGB.
         // Box-filter downscale produces better quality than nearest-neighbor.
         let rgb = if let Some(target_w) = width {
             if target_w < w && target_w > 0 {
-                let target_h = (h as u64 * target_w as u64 / w as u64) as u32;
+                let target_h = (h as u64 * target_w as u64 / w as u64).max(1) as u32;
                 let resized = resize_bgra_box(&pixels, w, h, target_w, target_h);
                 w = target_w;
                 h = target_h;
@@ -1181,6 +902,11 @@ mod win {
         let mut hasher = DefaultHasher::new();
         encoded.hash(&mut hasher);
         let hash = format!("{:016x}", hasher.finish());
+        let capture = serde_json::json!({
+            "method": method,
+            "occluded": occluded,
+            "x": left, "y": top, "width": source_w, "height": source_h,
+        });
 
         if previous_hash.as_deref() == Some(hash.as_str()) {
             return Ok(serde_json::json!({
@@ -1188,6 +914,7 @@ mod win {
                 "mimeType": mime_type,
                 "hash": hash,
                 "unchanged": true,
+                "capture": capture,
             }));
         }
 
@@ -1198,6 +925,7 @@ mod win {
             "mimeType": mime_type,
             "hash": hash,
             "unchanged": false,
+            "capture": capture,
         }))
     }
 

@@ -25,6 +25,50 @@ static EMERGENCY_LATCHED: AtomicBool = AtomicBool::new(false);
 static EMERGENCY_DETECTED_US: AtomicU64 = AtomicU64::new(0);
 static EMERGENCY_CLOCK_ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
 
+// ── Physical input counters (7.7.0, K5: takeover) ───────────────────────────
+//
+// How much the person moved the pointer (sum of |dx| + |dy| in points or pixels), and how many keys and buttons they
+// pressed, physical input only. The server compares readings taken during an action to tell a deliberate takeover (a
+// real drag of the mouse, a key, a click) from a nudge; zero-length moves (some wireless receivers stream them,
+// Windows-MCP #498) count for nothing (W8).
+static PHYSICAL_MOVEMENT: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL_KEYS: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL_BUTTONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
+fn count_movement(dx: i64, dy: i64) {
+    let amount = dx.unsigned_abs().saturating_add(dy.unsigned_abs());
+    if amount > 0 {
+        PHYSICAL_MOVEMENT.fetch_add(amount, Ordering::AcqRel);
+    }
+}
+
+#[napi(object)]
+pub struct PhysicalInputCounters {
+    /// False when no physical-input monitor runs (no permission, Wayland, or nothing started yet).
+    pub supported: bool,
+    pub movement: f64,
+    pub keys: f64,
+    pub buttons: f64,
+}
+
+/// Monotonic counters of physical input since this process started its monitor.
+#[napi]
+pub fn get_physical_input_counters() -> PhysicalInputCounters {
+    #[cfg(target_os = "macos")]
+    let supported = macos_monitor::ensure_started().is_ok();
+    #[cfg(target_os = "windows")]
+    let supported = windows_monitor::ensure_started().is_ok();
+    #[cfg(target_os = "linux")]
+    let supported = linux_x11_monitor::ensure_started().is_ok();
+    PhysicalInputCounters {
+        supported,
+        movement: PHYSICAL_MOVEMENT.load(Ordering::Acquire) as f64,
+        keys: PHYSICAL_KEYS.load(Ordering::Acquire) as f64,
+        buttons: PHYSICAL_BUTTONS.load(Ordering::Acquire) as f64,
+    }
+}
+
 fn emergency_monotonic_us() -> u64 {
     EMERGENCY_CLOCK_ORIGIN
         .get_or_init(std::time::Instant::now)
@@ -284,7 +328,7 @@ mod macos_monitor {
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
         EventField,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
     use std::sync::{mpsc, OnceLock};
     use std::time::{Duration, Instant};
     use super::seed_last_physical_ms;
@@ -292,6 +336,17 @@ mod macos_monitor {
     static CLOCK_ORIGIN: OnceLock<Instant> = OnceLock::new();
     static LAST_PHYSICAL_MS: AtomicU64 = AtomicU64::new(0);
     static TAP_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
+    /// The tap's mach port, so the callback can turn the tap back on (M2).
+    static TAP_PORT: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    extern "C" {
+        fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    }
+
+    /// kCGEventTapDisabledByTimeout and kCGEventTapDisabledByUserInput: the system turned the tap off. 7.7.0 (M2):
+    /// turn it back on; before, the guard read the person as idle forever after the first timeout.
+    const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
     /// The clock starts one day in, not at zero, so a "last physical input" before this process started (seeded
     /// from the system's idle counter at tap install) is representable: 0 reads as a day of idle, never as "now".
@@ -336,12 +391,41 @@ mod macos_monitor {
                     CGEventTapOptions::ListenOnly,
                     event_types,
                     |_proxy, event_type, event| {
+                        let kind = event_type as u32;
+                        if kind == TAP_DISABLED_BY_TIMEOUT || kind == TAP_DISABLED_BY_USER_INPUT {
+                            let port = TAP_PORT.load(Ordering::Acquire);
+                            if !port.is_null() {
+                                unsafe { CGEventTapEnable(port, true) };
+                            }
+                            return None;
+                        }
                         // kCGEventSourceStateHIDSystemState=1. Events posted by
                         // this runtime use a private source (-1); other process
                         // injection normally uses combined/private state (0/-1).
                         if super::macos_source_state_is_physical(
                             event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
                         ) {
+                            let moving = kind == CGEventType::MouseMoved as u32
+                                || kind == CGEventType::LeftMouseDragged as u32
+                                || kind == CGEventType::RightMouseDragged as u32
+                                || kind == CGEventType::OtherMouseDragged as u32;
+                            if moving {
+                                let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                                let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                                // A zero-length move is not the person (W8).
+                                if dx == 0 && dy == 0 {
+                                    return None;
+                                }
+                                super::count_movement(dx, dy);
+                            } else if kind == CGEventType::KeyDown as u32 {
+                                super::PHYSICAL_KEYS.fetch_add(1, Ordering::AcqRel);
+                            } else if kind == CGEventType::LeftMouseDown as u32
+                                || kind == CGEventType::RightMouseDown as u32
+                                || kind == CGEventType::OtherMouseDown as u32
+                                || kind == CGEventType::ScrollWheel as u32
+                            {
+                                super::PHYSICAL_BUTTONS.fetch_add(1, Ordering::AcqRel);
+                            }
                             LAST_PHYSICAL_MS.store(monotonic_ms(), Ordering::Release);
                             if event_type as u32 == CGEventType::KeyDown as u32 {
                                 let flags = event.get_flags();
@@ -384,6 +468,10 @@ mod macos_monitor {
                 // this process has posted nothing yet when the tap installs, so the reading is the user's.
                 LAST_PHYSICAL_MS.store(seed_last_physical_ms(monotonic_ms(), hid_idle_seconds()), Ordering::Release);
                 unsafe { run_loop.add_source(&source, kCFRunLoopCommonModes) };
+                {
+                    use core_foundation::base::TCFType;
+                    TAP_PORT.store(tap.mach_port.as_concrete_TypeRef() as *mut std::ffi::c_void, Ordering::Release);
+                }
                 tap.enable();
                 if sender.send(Ok(())).is_err() {
                     return;
@@ -492,15 +580,53 @@ mod windows_monitor {
     static LAST_PHYSICAL_TICK_MS: AtomicU64 = AtomicU64::new(0);
     static HOOK_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
     static PHYSICAL_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+    /// The last physical pointer position, packed (x in the high half), to measure movement and drop zero-length moves.
+    static LAST_POINT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    const WM_MOUSEMOVE: usize = 0x0200;
+    const BUTTON_DOWNS: [usize; 5] = [0x0201, 0x0204, 0x0207, 0x020B, 0x020A]; // L, R, M, X down; wheel
 
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let event = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             if super::windows_flags_are_physical(event.flags, LLMHF_INJECTED) {
-                LAST_PHYSICAL_TICK_MS.store(GetTickCount64(), Ordering::Release);
+                let mut counts = true;
+                if wparam.0 == WM_MOUSEMOVE {
+                    let packed = ((event.pt.x as u32 as u64) << 32) | event.pt.y as u32 as u64;
+                    let previous = LAST_POINT.swap(packed, Ordering::AcqRel);
+                    if previous == packed {
+                        // A zero-length move (W8): wireless receivers stream these; it is not the person.
+                        counts = false;
+                    } else if previous != u64::MAX {
+                        let (px, py) = ((previous >> 32) as u32 as i32, previous as u32 as i32);
+                        super::count_movement((event.pt.x - px) as i64, (event.pt.y - py) as i64);
+                    }
+                } else if BUTTON_DOWNS.contains(&wparam.0) {
+                    super::PHYSICAL_BUTTONS.fetch_add(1, Ordering::AcqRel);
+                }
+                if counts {
+                    LAST_PHYSICAL_TICK_MS.store(GetTickCount64(), Ordering::Release);
+                }
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    /// 7.7.0 (K5): the modifiers the chord sees are the tracked physical ones that are also down right now. A missed
+    /// key-up (the secure desktop, a hook timeout) left a modifier counted as held, so the chord could fire on fewer
+    /// keys than configured (the Windows-MCP #460 class).
+    fn reconciled_modifiers() -> u32 {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
+        let tracked = PHYSICAL_MODIFIERS.load(Ordering::Acquire);
+        let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+        let mut live = 0u32;
+        if down(VK_SHIFT.0) { live |= super::MOD_SHIFT; }
+        if down(VK_CONTROL.0) { live |= super::MOD_CTRL; }
+        if down(VK_MENU.0) { live |= super::MOD_ALT; }
+        if down(VK_LWIN.0) || down(VK_RWIN.0) { live |= super::MOD_META; }
+        let reconciled = tracked & live;
+        PHYSICAL_MODIFIERS.store(reconciled, Ordering::Release);
+        reconciled
     }
 
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -510,6 +636,9 @@ mod windows_monitor {
                 LAST_PHYSICAL_TICK_MS.store(GetTickCount64(), Ordering::Release);
                 let down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
                 let up = wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize;
+                if down {
+                    super::PHYSICAL_KEYS.fetch_add(1, Ordering::AcqRel);
+                }
                 let modifier = match event.vkCode {
                     0x10 | 0xA0 | 0xA1 => super::MOD_SHIFT,
                     0x11 | 0xA2 | 0xA3 => super::MOD_CTRL,
@@ -530,7 +659,7 @@ mod windows_monitor {
                         0x7B => super::TRIGGER_F12,
                         _ => 0,
                     };
-                    if super::chord_matches(PHYSICAL_MODIFIERS.load(Ordering::Acquire), trigger) {
+                    if trigger != 0 && super::chord_matches(reconciled_modifiers(), trigger) {
                         super::latch_emergency_stop();
                     }
                 }
@@ -846,11 +975,55 @@ mod linux_x11_monitor {
             {
                 let raw = &*(cookie.data as *const xinput2::XIRawEvent);
                 if devices.contains(&raw.sourceid) {
-                    LAST_PHYSICAL_MS.store(monotonic_ms(), Ordering::Release);
+                    let mut counts = true;
+                    match cookie.evtype {
+                        xinput2::XI_RawMotion => {
+                            // Sum the raw deltas of valuators 0 (x) and 1 (y); a zero-length move is not the person (W8).
+                            let (dx, dy) = raw_motion_xy(raw);
+                            if dx == 0.0 && dy == 0.0 {
+                                counts = false;
+                            } else {
+                                super::count_movement(dx.round() as i64, dy.round() as i64);
+                            }
+                        }
+                        xinput2::XI_RawKeyPress => {
+                            super::PHYSICAL_KEYS.fetch_add(1, Ordering::AcqRel);
+                        }
+                        xinput2::XI_RawButtonPress => {
+                            super::PHYSICAL_BUTTONS.fetch_add(1, Ordering::AcqRel);
+                        }
+                        _ => {}
+                    }
+                    if counts {
+                        LAST_PHYSICAL_MS.store(monotonic_ms(), Ordering::Release);
+                    }
                 }
             }
             xlib::XFreeEventData(display, &mut cookie);
         }
+    }
+
+    /// The raw x and y deltas of an XI2 raw motion event (valuators 0 and 1, when present in its mask).
+    unsafe fn raw_motion_xy(raw: &xinput2::XIRawEvent) -> (f64, f64) {
+        let mask = std::slice::from_raw_parts(raw.valuators.mask, raw.valuators.mask_len.max(0) as usize);
+        let mut value_index = 0usize;
+        let (mut dx, mut dy) = (0.0, 0.0);
+        for valuator in 0..(mask.len() * 8) {
+            if mask[valuator / 8] & (1 << (valuator % 8)) == 0 {
+                continue;
+            }
+            let value = *raw.raw_values.add(value_index);
+            match valuator {
+                0 => dx = value,
+                1 => dy = value,
+                _ => {}
+            }
+            value_index += 1;
+            if valuator >= 1 {
+                break;
+            }
+        }
+        (dx, dy)
     }
 
     fn install() -> Result<(), String> {

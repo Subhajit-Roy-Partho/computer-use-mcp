@@ -857,6 +857,7 @@ mod win {
 
     /// The virtual desktop (every monitor), in the coordinates input uses.
     fn virtual_desktop() -> (i32, i32, i32, i32) {
+        crate::dpi::ensure();
         unsafe {
             (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -1120,6 +1121,7 @@ mod win {
     #[napi]
     pub fn cursor_position() -> napi::Result<serde_json::Value> {
         use windows::Win32::Foundation::POINT;
+        crate::dpi::ensure();
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
             let _ = GetCursorPos(&mut pt);

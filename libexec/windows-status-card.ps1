@@ -119,15 +119,28 @@ $timer.Add_Tick({
   $current = if ($null -ne $script:frame -and $script:frame.action) { Describe $script:frame.action } else { 'Idle' }
   switch ($state) {
     'stopped' { $dot.Fill = '#D64545'; $title.Text = "Agent stopped · $elapsed"; $action.Text = 'No further desktop input this session. Restart the server to resume.'; $pause.IsEnabled = $false; $stop.IsEnabled = $false }
-    'paused'  { $dot.Fill = '#E8A33D'; $title.Text = "Agent paused · $elapsed"; $action.Text = 'Mutations are refused; it can still look. Resume when you are ready.'; $pause.Content = 'Resume'; $pause.IsEnabled = $true; $stop.IsEnabled = $true }
+    'paused'  {
+      $dot.Fill = '#E8A33D'; $pause.Content = 'Resume'; $pause.IsEnabled = $true; $stop.IsEnabled = $true
+      if ($null -ne $script:frame -and [string]$script:frame.reason -eq 'takeover') {
+        $title.Text = "You took over · $elapsed"; $action.Text = 'The agent waits while you use the mouse or keyboard, and resumes when you stop.'
+      } else {
+        $title.Text = "Agent paused · $elapsed"; $action.Text = 'Mutations are refused; it can still look. Resume when you are ready.'
+      }
+    }
     default {
       $pause.Content = 'Pause'; $pause.IsEnabled = $true; $stop.IsEnabled = $true
       $waiting = if ($null -ne $script:frame) { [string]$script:frame.waiting } else { '' }
       if ($waiting -eq 'user_active') { $dot.Fill = '#E8A33D'; $title.Text = "Agent waiting for you · $elapsed"; $action.Text = 'You are typing or moving the mouse; it resumes when you stop.' }
       elseif ($waiting -eq 'approval') { $dot.Fill = '#E8A33D'; $title.Text = "Agent needs approval · $elapsed"; $action.Text = $current }
-      else { $dot.Fill = '#3B82F6'; $title.Text = "Agent is using this PC · $elapsed"; $action.Text = $current }
+      else {
+        $dot.Fill = '#3B82F6'; $title.Text = "Agent is using this PC · $elapsed"; $action.Text = $current
+        $chord = if ($null -ne $script:frame) { [string]$script:frame.chord } else { '' }
+        if ($current -eq 'Idle' -and $chord) { $action.Text = "Idle · $(($chord -split '\+' | ForEach-Object { $_.Substring(0,1).ToUpper() + $_.Substring(1) }) -join '+') stops it from any app" }
+      }
     }
   }
+  $chordText = if ($null -ne $script:frame) { [string]$script:frame.chord } else { '' }
+  $stop.ToolTip = if ($chordText) { "Stop the agent for this session (or press $chordText anywhere)" } else { 'Stop the agent for this session' }
   $items = @()
   if ($null -ne $script:frame -and $script:frame.recent) { $items = @($script:frame.recent) }
   for ($i = 0; $i -lt $recent.Count; $i++) {
