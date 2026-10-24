@@ -803,3 +803,22 @@ mod win {
         Ok(found)
     }
 }
+
+/// 7.7.0 (K4): `activate_app` on a worker thread (Windows and Linux; see `activate_window_async`).
+#[cfg(not(target_os = "macos"))]
+#[napi_derive::napi]
+pub fn activate_app_async(
+    bundle_id: String,
+    timeout_ms: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            win::activate_app(bundle_id, timeout_ms)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::activate_app(bundle_id, timeout_ms)
+        }
+    })
+}

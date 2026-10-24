@@ -273,6 +273,18 @@ export interface NativeModule {
     capture?: { method: string; occluded: boolean; x: number; y: number; width: number; height: number }
   }
 
+  /**
+   * 7.7.0 (K4): the slow calls on a worker thread, resolving with what the synchronous call returns. The JavaScript
+   * thread (and the status card's Stop) is not held while a window is walked, captured or brought to the front. Optional:
+   * older native modules lack them, and activation stays synchronous on macOS. Callers go through `native-async.ts`.
+   */
+  takeScreenshotAsync?(...args: Parameters<NativeModule['takeScreenshot']>): Promise<ReturnType<NativeModule['takeScreenshot']>>
+  getUiTreeAsync?(...args: Parameters<NativeModule['getUiTree']>): Promise<ReturnType<NativeModule['getUiTree']>>
+  findElementAsync?(...args: Parameters<NativeModule['findElement']>): Promise<ReturnType<NativeModule['findElement']>>
+  getMenuBarAsync?(...args: Parameters<NativeModule['getMenuBar']>): Promise<ReturnType<NativeModule['getMenuBar']>>
+  activateWindowAsync?(...args: Parameters<NativeModule['activateWindow']>): Promise<ReturnType<NativeModule['activateWindow']>>
+  activateAppAsync?(...args: Parameters<NativeModule['activateApp']>): Promise<ReturnType<NativeModule['activateApp']>>
+
   // ── 7.7.0 (K5): is the desktop usable, and keep it awake while an agent works ──
   getSessionState?(): {
     locked: boolean | null

@@ -1,4 +1,5 @@
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { ok, okJsonWrappedScalar, type ToolResult } from '../result.js'
 import type { SpawnBounded } from './spawn.js'
 
@@ -141,7 +142,7 @@ export class SpacesHandler {
       if (await this.#yabaiAvailable()) {
         const target = (await this.#yabaiSpaces()).find(space => space.id === spaceId)
         const selector = target?.index ?? spaceId
-        try { this.#native.activateWindow(windowId) } catch { /* best effort */ }
+        try { await offThread(this.#native, 'activateWindow', windowId) } catch { /* best effort */ }
         await this.#sleep(250)
         const result = await this.#spawn('yabai', ['-m', 'window', '--space', String(selector)], 10_000)
         if (result.code === 0) return {

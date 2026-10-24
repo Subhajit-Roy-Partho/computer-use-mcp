@@ -16,6 +16,7 @@ need a native build and OS permissions. They are not unattended unit tests.
 | `npm run pack:platforms` | Require all six build artifacts and pack verified native tarballs. |
 | `node test/platform-install.mjs` | Install packed native dependencies using a disposable local registry and load the addon. |
 | `node scripts/verify-local-native.mjs` | Verify that source execution resolves and loads the current host build artifact; use a process-scoped `COMPUTER_USE_NATIVE_PATH`. |
+| `node scripts/utm-vms.mjs up\|status\|down` | On a Mac, tunnel to the server running in UTM Windows and Linux VMs and register it with Claude Code; see [Testing in UTM virtual machines](../docs/TESTING-IN-UTM.md). |
 
 `build-ts.mjs` compiles TypeScript into `dist.next` and swaps it into `dist`, so a server starting mid-build still finds its files (`clean-dist.mjs` only removes generated output). `live-windows.mjs` is
 an attended Windows development probe. Legacy Mission Control/Spaces experiments

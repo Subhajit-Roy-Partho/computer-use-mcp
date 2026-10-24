@@ -1,4 +1,5 @@
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { errJson, ok, okJson, type ToolResult, platformUnsupported } from '../result.js'
 import { PROVIDER_QUALITY, PROVIDER_WIDTH } from './constants.js'
 import type { TargetStateController } from './target-state.js'
@@ -153,7 +154,7 @@ export class ScreenshotHandler {
    * ScreenCaptureKit helper when it is available: the window alone (even covered,
    * never activated), without its shadow, so the image-to-screen mapping is exact.
    * Anything else — full screen, the agent pointer overlay, no helper, a helper
-   * failure — takes the synchronous native path in `handle`.
+   * failure — takes the native path in `handle` (on a worker thread when the native module can, 7.7.0 K4).
    */
   async handleAsync(tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult | undefined> {
     if ((tool === 'screenshot' || tool === 'zoom') && signal?.aborted) throw abortError(signal)
@@ -252,7 +253,7 @@ export class ScreenshotHandler {
     } catch (error) {
       if (!(error instanceof HelperFailure)) throw error
       if (error.code === 'aborted' || signal?.aborted) throw abortError(signal)
-      const screen = this.#native.takeScreenshot(undefined, undefined, 0, undefined, undefined)
+      const screen = await offThread(this.#native, 'takeScreenshot', undefined, undefined, 0, undefined, undefined)
       if (!screen.base64) throw new Error('Screenshot capture failed')
       const display = this.#native.getDisplaySize()
       const s = screen.width / display.width
@@ -339,7 +340,7 @@ export class ScreenshotHandler {
     ].join('\n')
   }
 
-  handle(tool: string, args: Record<string, unknown>): ToolResult | undefined {
+  async handle(tool: string, args: Record<string, unknown>): Promise<ToolResult | undefined> {
     if (tool === 'screenshot') {
       const provider = typeof args.provider === 'string' ? args.provider : this.#defaultProvider
       const width = typeof args.width === 'number' ? args.width
@@ -374,8 +375,8 @@ export class ScreenshotHandler {
       const showPointer = args.show_agent_pointer === true
       const scope = JSON.stringify([app, windowId, width, quality, windowId !== undefined ? this.#native.getWindow?.(windowId)?.bounds : undefined, args.display_id])
       const displayId = windowId === undefined && typeof args.display_id === 'number' ? args.display_id : undefined
-      let image = this.#native.takeScreenshot(
-        width, windowId === undefined ? app : undefined, quality,
+      let image = await offThread(
+        this.#native, 'takeScreenshot', width, windowId === undefined ? app : undefined, quality,
         showPointer || scope !== this.#lastCaptureScope ? undefined : this.#lastHash, windowId, displayId,
       )
       if (!showPointer && image.unchanged && this.#lastResult) {
@@ -384,7 +385,7 @@ export class ScreenshotHandler {
       }
       if (!image.base64) {
         // The native layer skips encoding an unchanged frame; a re-send needs the image itself.
-        image = this.#native.takeScreenshot(width, windowId === undefined ? app : undefined, quality, undefined, windowId, displayId)
+        image = await offThread(this.#native, 'takeScreenshot', width, windowId === undefined ? app : undefined, quality, undefined, windowId, displayId)
       }
       if (!image.base64) throw new Error('Screenshot capture missing image payload')
       if (showPointer) image = this.#pointer.annotateScreenshot(image)
@@ -408,7 +409,7 @@ export class ScreenshotHandler {
       if (x1 >= x2 || y1 >= y2) {
         throw new Error(`Invalid region: x1(${x1}) must be < x2(${x2}), y1(${y1}) must be < y2(${y2})`)
       }
-      const source = this.#native.takeScreenshot(undefined, undefined, 0, undefined, undefined)
+      const source = await offThread(this.#native, 'takeScreenshot', undefined, undefined, 0, undefined, undefined)
       if (!source.base64) throw new Error('Screenshot capture failed')
       // A missing native export used to surface as `cropImage is not a function`, a
       // TypeError from JavaScript reaching for something that was never built for this

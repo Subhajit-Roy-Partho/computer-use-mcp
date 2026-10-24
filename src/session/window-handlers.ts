@@ -1,4 +1,5 @@
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { errJson, ok, okJson, okJsonWrappedArray, platformUnsupported, type ToolResult } from '../result.js'
 import { PROVIDER_WIDTH } from './constants.js'
 import type { SpawnResult } from './spawn.js'
@@ -85,7 +86,7 @@ export async function handleWindowTool(
     const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : undefined
     guardActivation(bundleId, `activate ${bundleId}`)
     const frontmostBefore = native.getFrontmostApp()
-    const result = native.activateApp(bundleId, timeoutMs ?? 2_000)
+    const result = await offThread(native, 'activateApp', bundleId, timeoutMs ?? 2_000)
     await context.sleep(80)
     const frontmostAfter = native.getFrontmostApp()
     const activated = result.activated || frontmostAfter?.bundleId === bundleId
@@ -133,10 +134,10 @@ export async function handleWindowTool(
         native.unhideApp(bundleId)
         await context.sleep(100)
       }
-      native.activateApp(bundleId, timeoutMs ?? 2_000)
+      await offThread(native, 'activateApp', bundleId, timeoutMs ?? 2_000)
       await context.sleep(80)
     }
-    const result = native.activateWindow(windowId, timeoutMs)
+    const result = await offThread(native, 'activateWindow', windowId, timeoutMs)
     await context.sleep(80)
     if (result.activated && bundleId) targets.update({ bundleId, windowId }, 'activation')
     const payload = {
@@ -151,7 +152,7 @@ export async function handleWindowTool(
   if (tool === 'open_application') {
     const bundleId = stringArg(args, 'bundle_id')
     guardActivation(bundleId, `open and focus ${bundleId}`)
-    const result = native.activateApp(bundleId, 3_000)
+    const result = await offThread(native, 'activateApp', bundleId, 3_000)
     if (result.activated) targets.update({ bundleId }, 'activation')
     await context.sleep(300)
     if (!result.activated) {
@@ -270,14 +271,14 @@ export async function handleWindowTool(
         ? windows.find(window => window.windowId === targetWindowId)
         : windows.find(window => window.isFocused)
       if (focused) {
-        try { desktop += `\n\nUI Tree (${focused.bundleId}):\n${JSON.stringify(native.getUiTree(focused.windowId, 5)).slice(0, 4000)}` }
+        try { desktop += `\n\nUI Tree (${focused.bundleId}):\n${JSON.stringify(await offThread(native, 'getUiTree', focused.windowId, 5)).slice(0, 4000)}` }
         catch { /* semantic capture is best effort */ }
       }
     }
     content.push({ type: 'text', text: desktop })
     if (args.use_vision) {
       const width = typeof args.width === 'number' ? args.width : PROVIDER_WIDTH[context.defaultProvider] ?? 1024
-      const screenshot = native.takeScreenshot(width, undefined, 80, undefined, targetWindowId)
+      const screenshot = await offThread(native, 'takeScreenshot', width, undefined, 80, undefined, targetWindowId)
       if (screenshot.base64) {
         // Window annotations are drawn in screen space, so only on a screen capture.
         const annotate = args.use_annotation && Array.isArray(windows) && targetWindowId === undefined

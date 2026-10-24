@@ -482,3 +482,15 @@ mod platform {
         }
     }
 }
+
+/// 7.7.0 (K4): `activate_window` on a worker thread. On Windows and Linux activation waits for the window to come to the
+/// front (up to the timeout); the JavaScript thread is not held while it does. macOS keeps the synchronous call: its
+/// activation goes through AppKit.
+#[cfg(not(target_os = "macos"))]
+#[napi_derive::napi]
+pub fn activate_window_async(
+    window_id: u32,
+    timeout_ms: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || platform::activate_window(window_id, timeout_ms))
+}

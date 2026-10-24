@@ -1103,3 +1103,32 @@ mod win {
         }))
     }
 }
+
+/// 7.7.0 (K4): `take_screenshot` on a worker thread. A capture with its encode takes tens to hundreds of milliseconds;
+/// the JavaScript thread is not held for it. `display_id` is used on Windows only, as in the synchronous call.
+#[napi_derive::napi]
+pub fn take_screenshot_async(
+    width: Option<u32>,
+    target_app: Option<String>,
+    quality: Option<u32>,
+    previous_hash: Option<String>,
+    window_id: Option<u32>,
+    display_id: Option<u32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            win::take_screenshot(width, target_app, quality, previous_hash, window_id, display_id)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = display_id;
+            macos::take_screenshot(width, target_app, quality, previous_hash, window_id)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = display_id;
+            linux::take_screenshot(width, target_app, quality, previous_hash, window_id)
+        }
+    })
+}

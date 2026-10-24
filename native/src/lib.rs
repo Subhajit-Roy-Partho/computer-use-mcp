@@ -1,4 +1,5 @@
 mod accessibility;
+mod async_task;
 #[cfg(target_os = "windows")]
 mod capture_win;
 mod activity;

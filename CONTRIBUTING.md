@@ -189,6 +189,10 @@ npx tsx examples/browser-test.ts      # Safari navigation
 npx tsx examples/demo-v4.ts           # Window targeting
 ```
 
+To test Windows and Linux desktops from an Apple Silicon Mac, see
+[Testing in UTM virtual machines](docs/TESTING-IN-UTM.md). `scripts/utm-vms.mjs` tunnels to the server in each VM
+and registers it with Claude Code.
+
 ## Pull requests
 
 - Keep PRs focused — one feature or fix per PR

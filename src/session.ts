@@ -11,7 +11,7 @@ import { withToolDefaults } from './registry/definitions.js'
 import { discoverApplications } from './session/application-discovery.js'
 import { okJson } from './result.js'
 import { loadNative, type NativeModule } from './native.js'
-import { DEFAULT_PROFILE, MUTATING_TOOLS, RUN_STEP_TOOLS, getToolMeta, parseProfile, toolAvailableOn, toolInProfile } from './tool-catalog.js'
+import { DEFAULT_PROFILE, MUTATING_TOOLS, RUN_STEP_TOOLS, callMutates, getToolMeta, parseProfile, toolAvailableOn, toolInProfile } from './tool-catalog.js'
 import { applyContract, withRefusalAdvice, type Effect } from './session/contract.js'
 import { sleep, sleepAbortable, defaultSpawnBounded } from './session/spawn.js'
 import type { SpawnBounded } from './session/spawn.js'
@@ -409,8 +409,10 @@ export function createSession(opts: SessionOptions = {}): Session {
     // Observation tools stay concurrent and cheap.
     const startedAt = Date.now()
     const startedAtIso = new Date(startedAt).toISOString()
-    const mutates = MUTATING_TOOLS.has(tool)
-    let policyDecision = evaluatePolicy(tool, args, mutates)
+    const mutates = callMutates(tool, args)
+    // Policy is unchanged by a read-only mode: approval rules name tools, and `COMPUTER_USE_REQUIRE_APPROVAL` still
+    // covers every call of a mutating tool. Only the lock and the person's pause look at the call.
+    let policyDecision = evaluatePolicy(tool, args, MUTATING_TOOLS.has(tool))
 
     // The native latch is process-global and outlives MCP connections. Apply
     // it to the dispatcher too so all mutation remains disabled while latched.
@@ -778,7 +780,7 @@ export function createSession(opts: SessionOptions = {}): Session {
 
   const coordinated: Session['dispatch'] = async (tool, args, signal, progress, context) => {
     if (closed) throw new Error('Session is closed')
-    const mutates = MUTATING_TOOLS.has(tool) && !context?.preflight
+    const mutates = callMutates(tool, args) && !context?.preflight
     // 7.6.1: the person's pause/stop state gates every mutation and aborts the one in flight.
     if (mutates) {
       const refusal = control.gate(tool)

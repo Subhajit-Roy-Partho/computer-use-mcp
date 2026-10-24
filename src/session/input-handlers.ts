@@ -1,5 +1,6 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
 import type { AXBounds, NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { ok, okJson, type ToolResult } from '../result.js'
 import type { Effect } from './contract.js'
 import { StructuredToolError } from './errors.js'
@@ -340,7 +341,7 @@ export class InputHandler {
       if (windowId !== undefined && this.#helper?.supportsCapture()) {
         return (await this.#helper.capture({ windowId, width: 480, format: 'jpeg', quality: 60 })).hash
       }
-      return this.#native.takeScreenshot(480, undefined, 60, undefined, windowId).hash
+      return (await offThread(this.#native, 'takeScreenshot', 480, undefined, 60, undefined, windowId)).hash
     } catch { return undefined }
   }
 
@@ -672,7 +673,7 @@ export class InputHandler {
       const locations = Array.isArray(args.locs) ? [...args.locs] as [number, number][] : []
       if (Array.isArray(args.labels) && args.labels.length > 0 && resolved.windowId) {
         for (const label of args.labels as string[]) {
-          const found = this.#resolveLabel(resolved.windowId, label)
+          const found = await this.#resolveLabel(resolved.windowId, label)
           if (found) locations.push(found)
         }
       }
@@ -713,7 +714,7 @@ export class InputHandler {
     const edits = Array.isArray(args.locs) ? [...args.locs] as [number, number, string][] : []
     if (Array.isArray(args.labels) && args.labels.length > 0 && resolved.windowId) {
       for (const [label, text] of args.labels as [string, string][]) {
-        const found = this.#resolveLabel(resolved.windowId, label)
+        const found = await this.#resolveLabel(resolved.windowId, label)
         if (found) edits.push([found[0], found[1], text])
       }
     }
@@ -832,9 +833,9 @@ export class InputHandler {
     }
   }
 
-  #resolveLabel(windowId: number, label: string): [number, number] | undefined {
+  async #resolveLabel(windowId: number, label: string): Promise<[number, number] | undefined> {
     try {
-      const elements = this.#native.findElement(windowId, undefined, label, undefined, 1)
+      const elements = await offThread(this.#native, 'findElement', windowId, undefined, label, undefined, 1)
       const values = Array.isArray(elements) ? elements : JSON.parse(JSON.stringify(elements))
       const bounds = values[0]?.bounds
       return bounds

@@ -1,4 +1,5 @@
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { FocusError } from './errors.js'
 import type { FocusFailure } from './errors.js'
 import type { UserActivityGuard } from './user-activity.js'
@@ -128,10 +129,10 @@ export function createFocusController(options: {
         native.unhideApp(target.bundleId)
         await options.sleep(100)
       }
-      native.activateApp(target.bundleId, 2000)
+      await offThread(native, 'activateApp', target.bundleId, 2000)
       await options.sleep(80)
       if (target.windowId != null) {
-        try { native.activateWindow(target.windowId) } catch { /* best effort */ }
+        try { await offThread(native, 'activateWindow', target.windowId) } catch { /* best effort */ }
         await options.sleep(80)
       }
       const frontmostAfter = native.getFrontmostApp()?.bundleId ?? null

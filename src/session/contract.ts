@@ -15,7 +15,7 @@
  * first refusal even when a working route existed, and reported success for clicks nothing had confirmed.
  */
 
-import { MUTATING_TOOLS, getToolMeta } from '../tool-catalog.js'
+import { callMutates, getToolMeta } from '../tool-catalog.js'
 import type { ToolResult } from '../result.js'
 
 export type Effect = 'verified' | 'changed' | 'no_visible_change' | 'unverified'
@@ -362,7 +362,7 @@ export function applyContract(
 ): ToolResult {
   const { contract: given, ...rest } = result
   if (result.isError) return withRefusalAdvice(tool, args, rest, available)
-  if (!MUTATING_TOOLS.has(tool) && tool !== 'run_steps') return rest
+  if (!callMutates(tool, args) && tool !== 'run_steps') return rest
   const base = defaultContract(tool, args, platform)
   const contract: ActionContract = { ...base, ...given }
   if (contract.effect === 'verified') {

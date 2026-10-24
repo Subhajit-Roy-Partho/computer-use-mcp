@@ -1,5 +1,6 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import type { SpawnBounded, SpawnResult } from './spawn.js'
 import { utf8Env } from './input-handlers.js'
 import type { LegacyPolicyConfig } from './legacy-policy.js'
@@ -93,7 +94,7 @@ export async function runDoctor(options: {
   // missing — so the permission itself is the fact, not the image payload.
   const captureTrust = isMacos ? nativePermission(options.native, 'display_capture') : undefined
   try {
-    const shot = options.native.takeScreenshot(320, undefined, 80, undefined, undefined)
+    const shot = await offThread(options.native, 'takeScreenshot', 320, undefined, 80, undefined, undefined)
     const captureDenied = captureTrust?.granted === false
     add({
       id: 'display_capture', status: captureDenied || !shot.base64 ? 'fail' : 'pass',

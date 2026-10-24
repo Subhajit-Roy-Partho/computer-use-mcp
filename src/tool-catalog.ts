@@ -298,6 +298,25 @@ export const MUTATING_TOOLS = new Set(
   Object.entries(TOOL_CATALOG).filter(([, meta]) => meta.mutates).map(([name]) => name),
 )
 
+/**
+ * 7.7.0: the read-only modes of the admin tools. `filesystem`, `registry` and `process_kill` are mutating tools, but a
+ * search, a registry read or a process list changes nothing: it takes no desktop lock, is not paused by the person,
+ * and is never refused because another server is typing. (A search used to fail with `locked_by_pid` while another
+ * server held the lock.)
+ */
+const READ_ONLY_MODES: Readonly<Record<string, readonly string[]>> = {
+  filesystem: ['read', 'list', 'search', 'info'],
+  registry: ['get', 'list'],
+  process_kill: ['list'],
+}
+
+/** Whether this call changes anything: a mutating tool, unless its `mode` is one of the tool's read-only modes. */
+export function callMutates(tool: string, args: Record<string, unknown>): boolean {
+  if (!MUTATING_TOOLS.has(tool)) return false
+  const mode = args.mode
+  return !(typeof mode === 'string' && READ_ONLY_MODES[tool]?.includes(mode))
+}
+
 export function getToolMeta(name: string): ToolMeta | undefined {
   return TOOL_CATALOG[name]
 }

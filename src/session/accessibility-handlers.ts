@@ -1,4 +1,5 @@
 import type { AXElement, NativeModule, WindowRecord } from '../native.js'
+import { offThread } from './native-async.js'
 import { errJson, ok, okJson, platformUnsupported, type ToolResult } from '../result.js'
 import { lookupToolGuide } from './tool-guide.js'
 import { selectMainWindow } from './window-select.js'
@@ -61,11 +62,11 @@ export function probeAccessibilityTree(root: AXElement): AccessibilityProbe {
   return { nodes, hasControls }
 }
 
-function probeMainWindow(native: NativeModule, windows: WindowRecord[]): AccessibilityProbe {
+async function probeMainWindow(native: NativeModule, windows: WindowRecord[]): Promise<AccessibilityProbe> {
   const main = selectMainWindow(windows, {}) ?? windows[0]
   if (!main) return { nodes: 0, hasControls: false, error: 'no_window' }
   try {
-    return probeAccessibilityTree(native.getUiTree(main.windowId, CAPABILITY_PROBE_DEPTH))
+    return probeAccessibilityTree(await offThread(native, 'getUiTree', main.windowId, CAPABILITY_PROBE_DEPTH))
   } catch (error) {
     return { nodes: 0, hasControls: false, error: error instanceof Error ? error.message : String(error) }
   }
@@ -134,15 +135,15 @@ function levenshtein(left: string, right: string): number {
   return previous[right.length]
 }
 
-function similarLabels(
+async function similarLabels(
   native: NativeModule,
   targetWindowId: number,
   label: string,
   message: string,
   role?: string,
-): ToolResult {
+): Promise<ToolResult> {
   const target = label.toLowerCase()
-  const similar = native.findElement(targetWindowId, role, undefined, undefined, 200)
+  const similar = (await offThread(native, 'findElement', targetWindowId, role, undefined, undefined, 200))
     .map(element => ({
       element: sanitizeAccessibilityResult(element) as typeof element,
       distance: levenshtein((element.label ?? '').toLowerCase(), target),
@@ -183,8 +184,8 @@ export async function handleAccessibilityTool(
   const isWindows = (context.platform ?? process.platform) === 'win32'
 
   if (tool === 'get_ui_tree') {
-    return ok(JSON.stringify(sanitizeAccessibilityResult(native.getUiTree(
-      windowId(args), typeof args.max_depth === 'number' ? args.max_depth : undefined,
+    return ok(JSON.stringify(sanitizeAccessibilityResult(await offThread(
+      native, 'getUiTree', windowId(args), typeof args.max_depth === 'number' ? args.max_depth : undefined,
     ))))
   }
   if (tool === 'get_focused_element') {
@@ -195,8 +196,8 @@ export async function handleAccessibilityTool(
     const label = typeof args.label === 'string' ? args.label : undefined
     const value = typeof args.value === 'string' ? args.value : undefined
     if (!role && !label && !value) throw new Error('find_element requires at least one of: role, label, value')
-    return ok(JSON.stringify(sanitizeAccessibilityResult(native.findElement(
-      windowId(args), role, label, value,
+    return ok(JSON.stringify(sanitizeAccessibilityResult(await offThread(
+      native, 'findElement', windowId(args), role, label, value,
       typeof args.max_results === 'number' ? args.max_results : undefined,
     ))))
   }
@@ -228,7 +229,7 @@ export async function handleAccessibilityTool(
       if (result.reason === 'disabled') {
         return { content: [{ type: 'text', text: `Element ${role} "${label}" is disabled` }], isError: true }
       }
-      return similarLabels(native, target.windowId, label, `No element matches role="${role}" label="${label}"`)
+      return await similarLabels(native, target.windowId, label, `No element matches role="${role}" label="${label}"`)
     }
 
     if (tool === 'set_value') {
@@ -240,7 +241,7 @@ export async function handleAccessibilityTool(
         context.targets.update(target, 'keyboard')
         // 7.7.0 (K1): read the value back. A protected field's value is never read (null), so it stays unverified.
         let readBack: string | null | undefined
-        try { readBack = native.findElement(target.windowId, role, label, undefined, 1)[0]?.value } catch { readBack = undefined }
+        try { readBack = (await offThread(native, 'findElement', target.windowId, role, label, undefined, 1))[0]?.value } catch { readBack = undefined }
         const effect = readBack === value ? 'verified' as const : 'unverified' as const
         return { ...ok(`Set ${role} "${label}"`), contract: effect === 'verified' ? { effect } : {
           effect,
@@ -253,7 +254,7 @@ export async function handleAccessibilityTool(
         return { content: [{ type: 'text', text: `Element ${role} "${label}" is read-only` }], isError: true }
       }
       if (result.reason === 'not_found') {
-        return similarLabels(native, target.windowId, label, `No element matches role="${role}" label="${label}"`)
+        return await similarLabels(native, target.windowId, label, `No element matches role="${role}" label="${label}"`)
       }
       return { content: [{ type: 'text', text: `set_value failed: ${result.reason ?? 'unknown'}` }], isError: true }
     }
@@ -268,7 +269,7 @@ export async function handleAccessibilityTool(
       if (result.reason === 'disabled') {
         return { content: [{ type: 'text', text: `Button "${label}" is disabled` }], isError: true }
       }
-      return similarLabels(native, target.windowId, label, `No button matches label="${label}"`, 'AXButton')
+      return await similarLabels(native, target.windowId, label, `No button matches label="${label}"`, 'AXButton')
     }
 
     const fields = args.fields
@@ -311,7 +312,7 @@ export async function handleAccessibilityTool(
     return {
       content: [{ type: 'text', text: JSON.stringify({
         error: result.reason ?? 'menu_item_not_found', bundle_id: bundleId,
-        menu, item, submenu, availableMenus: native.getMenuBar(bundleId).map(entry => entry.title),
+        menu, item, submenu, availableMenus: (await offThread(native, 'getMenuBar', bundleId)).map(entry => entry.title),
       }) }],
       isError: true,
     }
@@ -319,7 +320,7 @@ export async function handleAccessibilityTool(
   if (tool === 'list_menu_bar') {
     if (isWindows) return platformUnsupported('list_menu_bar', 'macOS',
       'Use get_ui_tree to discover menu structure on Windows.')
-    return ok(JSON.stringify(native.getMenuBar(stringArg(args, 'bundle_id'))))
+    return ok(JSON.stringify(await offThread(native, 'getMenuBar', stringArg(args, 'bundle_id'))))
   }
 
   if (tool === 'run_script') {
@@ -364,7 +365,7 @@ export async function handleAccessibilityTool(
     const windows = native.listWindows(bundleId)
     if (isWindows) {
       // 7.6.1: the same probe as macOS; `accessible` means real controls, not "has a window".
-      const accessibility = probeMainWindow(native, windows)
+      const accessibility = await probeMainWindow(native, windows)
       return okJson({
         bundle_id: bundleId, scriptable: false, suites: [], powershell: true,
         accessible: accessibility.hasControls, accessibility, topLevelCount: windows.length,
@@ -376,7 +377,7 @@ export async function handleAccessibilityTool(
     const scriptable = !('error' in dictionary)
     // v7.6: an app that draws its own UI (Unreal, Blender) has a window and three buttons and
     // nothing else; "has windows" is not "accessible". `accessible` now means real controls.
-    const accessibility = probeMainWindow(native, windows)
+    const accessibility = await probeMainWindow(native, windows)
     return okJson({
       bundle_id: bundleId,
       scriptable,

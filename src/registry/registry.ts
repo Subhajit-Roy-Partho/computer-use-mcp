@@ -329,7 +329,7 @@ export class ToolRegistry {
         issues: validated.error.issues.map(issue => ({ path: issue.path.join('.') || '(root)', message: issue.message })),
       }
     }
-    return { ok: true, args: validated.data as Record<string, unknown> }
+    return { ok: true, args: validated.data }
   }
 
   registerAll(server: McpServer): void {
