@@ -18,6 +18,11 @@ function runNpm(args) {
 function errorCode(result) {
   try { return JSON.parse(result.stdout).error?.code } catch { return undefined }
 }
+/** E409 for a version that is staged and awaiting approval, which staging again cannot replace. */
+function alreadyStaged(result) {
+  const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`
+  return errorCode(result) === 'E409' && /already staged|Cannot stage previously published version/i.test(text)
+}
 
 export function stagePlatformPackages(directory = root, npm = runNpm) {
   const rootPkg = readJson(join(directory, 'package.json'))
@@ -54,8 +59,11 @@ export function stagePlatformPackages(directory = root, npm = runNpm) {
     const spec = `${pkg.name}@${version}`
     const existing = npm(['view', spec, 'dist.integrity', '--json'])
     if (existing.status === 0) {
-      if (JSON.parse(existing.stdout) !== integrity) throw new Error(`Published ${spec} differs from this build; bump the version`)
-      console.log(`${spec} already published with identical integrity — skipping`)
+      // 7.6.2: a published version is immutable, and Windows binaries differ from build to build, so a different
+      // tarball is not a reason to fail the release: nothing is staged for it, as the main package step does.
+      if (JSON.parse(existing.stdout) !== integrity) {
+        console.warn(`::warning::${spec} is already published and this build's tarball differs; nothing staged for it. Bump the version to publish again.`)
+      } else console.log(`${spec} already published with identical integrity — skipping`)
     } else {
       if (errorCode(existing) !== 'E404') throw new Error(`Cannot check ${spec}: ${existing.stderr || existing.stdout}`)
       pending.push({ spec, archive, integrity })
@@ -63,6 +71,12 @@ export function stagePlatformPackages(directory = root, npm = runNpm) {
   }
   for (const { spec, archive, integrity } of pending) {
     const result = npm(['stage', 'publish', archive, '--access', 'public', '--provenance', '--ignore-scripts', '--json'])
+    if (result.status !== 0 && alreadyStaged(result)) {
+      // A version staged and awaiting approval (E409) is not an error either: staging again cannot replace it, and the
+      // maintainer compares the pending tarball with this run's release evidence before approving (7.6.1 behaviour).
+      console.warn(`::warning::${spec} is already staged and awaiting approval; nothing staged again. Compare it with release evidence ${integrity} before approving.`)
+      continue
+    }
     if (result.status !== 0) {
       const git = process.env.GITHUB_SHA ? undefined : spawnSync('git', ['rev-parse', 'HEAD'], {
         cwd: directory, encoding: 'utf8', timeout: 5000,

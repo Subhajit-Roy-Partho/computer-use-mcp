@@ -139,10 +139,10 @@
     "docs/assets/deepseek-ledger-run.mp4"
   ],
   "scripts": {
-    "build:native": "cd native && cargo build --release && cp target/release/libcomputer_use_napi.dylib ../computer-use-napi.darwin-$(uname -m | sed 's/x86_64/x64/' | sed 's/aarch64/arm64/').node && cp target/release/libcomputer_use_napi.dylib ../computer-use-napi.node && codesign --force --sign - ../computer-use-napi.darwin-$(uname -m | sed 's/x86_64/x64/' | sed 's/aarch64/arm64/').node ../computer-use-napi.node",
-    "build:native:win": "cd native && cargo build --release && copy target\\release\\computer_use_napi.dll ..\\computer-use-napi.win32-x64.node",
-    "build:native:win:arm64": "cd native && cargo build --release --target aarch64-pc-windows-msvc && copy target\\aarch64-pc-windows-msvc\\release\\computer_use_napi.dll ..\\computer-use-napi.win32-arm64.node",
-    "build:native:linux": "cd native && cargo build --release && cp target/release/libcomputer_use_napi.so ../computer-use-napi.linux-$(uname -m | sed 's/x86_64/x64/' | sed 's/aarch64/arm64/').node && cp target/release/libcomputer_use_napi.so ../computer-use-napi.node",
+    "build:native": "node scripts/build-native.mjs",
+    "build:native:win": "node scripts/build-native.mjs",
+    "build:native:win:arm64": "node scripts/build-native.mjs --target aarch64-pc-windows-msvc",
+    "build:native:linux": "node scripts/build-native.mjs",
     "build:ts": "node scripts/build-ts.mjs",
     "lint": "eslint src",
     "build": "npm run build:native && npm run build:ts",

@@ -100,23 +100,30 @@ After all existing release gates pass, the upstream main-push release job:
 2. Packs and verifies the universal main package and exact optional version pins.
 3. Attests the six binaries and all seven tarballs; retains the main SBOM
    attestation and uploads immutable release evidence.
-4. Validates every native tarball's integrity and checks npm for existing versions.
-   Identical published versions are skipped; conflicting bytes or registry errors
-   fail the release before any new native package is staged.
+4. Validates every native tarball's integrity, then asks npm whether the main
+   version is already published. When it is, the push is not a release and nothing
+   is staged (7.7.0). Otherwise it checks each native version: an identical
+   published version is skipped; a published version whose bytes differ from this
+   build (Windows binaries are not reproducible build to build) is skipped with a
+   warning, since published versions are immutable; a registry error fails the
+   release before any new native package is staged.
 5. Stages all six native packages with `npm stage publish --access public
    --provenance`, then stages the main tarball with the existing approval flow.
 
 Only this upstream repository can stage releases; fork and PR workflows only
-build and test. Every failed staging request, including an already pending
-version (E409), fails the release; unverified pending contents are never skipped
-as a success. Errors identify the package/version, commit, tarball and integrity.
-A native staging failure prevents the main staging step. Already staged packages
-are not rolled back automatically; publication is not atomic across seven packages.
-Use a maintainer session to inspect conflicting pending tarballs against the
-original run's immutable release evidence. Reuse those exact tarballs when
-recovering the same release; rebuilding the same commit need not reproduce the
-same bytes. Changed contents require a new synchronized version. CI does not
-add credentials for inspecting, approving or rejecting pending packages.
+build and test. A version that is already staged and awaiting approval (E409,
+"Cannot stage previously published version") is reported with a warning and not
+staged again, for the native packages and the main package alike: staging again
+cannot replace a pending tarball, and the review happens at approval. Any other
+failed staging request fails the release, and the error names the package and
+version, commit, tarball and integrity. A native staging failure prevents the main
+staging step. Already staged packages are not rolled back automatically;
+publication is not atomic across seven packages, which is also why a push to main
+never cancels the run before it. Use a maintainer session to inspect pending
+tarballs against the original run's immutable release evidence. Reuse those exact
+tarballs when recovering the same release; rebuilding the same commit need not
+reproduce the same bytes. Changed contents require a new synchronized version. CI
+does not add credentials for inspecting, approving or rejecting pending packages.
 Review the matching release evidence, approve all six native packages first,
 then approve the main package. Neither the workflow nor the scripts approve
 packages automatically. Existing published main versions remain immutable;
