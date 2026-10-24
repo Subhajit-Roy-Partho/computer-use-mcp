@@ -1,90 +1,114 @@
 // ── Linux implementation ──────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::{linux_desktop, linux_tools};
     use base64::Engine;
     use napi_derive::napi;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::process::Command;
-    use std::sync::OnceLock;
+    use std::path::Path;
 
-    static IS_WAYLAND: OnceLock<bool> = OnceLock::new();
+    /// 7.7.0 (K7): the XDG desktop portal's Screenshot, for Wayland sessions where no capture tool works (GNOME 41
+    /// and later refuse `gnome-screenshot`'s old D-Bus call from other programs). The reply arrives as a signal on a
+    /// request object, so it needs one process holding the bus connection: python3 with GObject introspection, the
+    /// same dependency as the AT-SPI bridge. A fixed script; the only argument is the output path.
+    const PORTAL_SCRIPT: &str = r#"
+import os, shutil, sys, urllib.parse
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+out = sys.argv[1]
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+token = 'computer_use_%d' % os.getpid()
+sender = bus.get_unique_name()[1:].replace('.', '_')
+path = '/org/freedesktop/portal/desktop/request/%s/%s' % (sender, token)
+loop = GLib.MainLoop()
+result = {}
+def on_response(_c, _s, _p, _i, _n, params):
+    code, results = params.unpack()
+    result['code'] = code
+    result['uri'] = results.get('uri')
+    loop.quit()
+bus.signal_subscribe('org.freedesktop.portal.Desktop', 'org.freedesktop.portal.Request', 'Response', path, None,
+                     Gio.DBusSignalFlags.NONE, on_response)
+bus.call_sync('org.freedesktop.portal.Desktop', '/org/freedesktop/portal/desktop', 'org.freedesktop.portal.Screenshot',
+              'Screenshot', GLib.Variant('(sa{sv})', ('', {'handle_token': GLib.Variant('s', token),
+                                                            'interactive': GLib.Variant('b', False)})),
+              GLib.VariantType('(o)'), Gio.DBusCallFlags.NONE, -1, None)
+def give_up():
+    result['code'] = 'timeout'
+    loop.quit()
+GLib.timeout_add_seconds(30, give_up)
+loop.run()
+if result.get('code') == 0 and result.get('uri'):
+    shutil.move(urllib.parse.unquote(urllib.parse.urlparse(result['uri']).path), out)
+    sys.exit(0)
+reasons = {1: 'the screenshot was declined (the portal asks the person the first time)', 'timeout': 'no answer in 30 s'}
+sys.stderr.write('portal screenshot failed: %s' % reasons.get(result.get('code'), 'code %s' % result.get('code')))
+sys.exit(1)
+"#;
 
-    fn is_wayland() -> bool {
-        *IS_WAYLAND.get_or_init(|| {
-            std::env::var("XDG_SESSION_TYPE")
-                .map(|v| v == "wayland")
-                .unwrap_or(false)
-        })
+    /// Run one capture tool. True when it exited 0 and left a non-empty file; otherwise why not, for the error.
+    fn attempt(tool: &str, args: &[&str], path: &Path, tried: &mut Vec<String>) -> bool {
+        match linux_tools::run(tool, args) {
+            Ok(_) if path.metadata().map(|meta| meta.len() > 0).unwrap_or(false) => true,
+            Ok(_) => {
+                tried.push(format!("{tool} wrote no image"));
+                false
+            }
+            Err(error) => {
+                tried.push(error.reason);
+                false
+            }
+        }
     }
 
-    fn capture_wayland(tmp_path: &str, _window_id: Option<u32>) -> bool {
-        // Try gnome-screenshot first (works on some GNOME Wayland versions)
-        if Command::new("gnome-screenshot")
-            .args(["-f", tmp_path])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            if std::path::Path::new(tmp_path).exists() {
-                return true;
+    fn capture_wayland(path: &Path, window_id: Option<u32>, tried: &mut Vec<String>) -> bool {
+        let file = path.to_string_lossy();
+        // A window on a wlroots compositor: grim cuts its rectangle out of the screen (covered parts show what
+        // covers them).
+        if let Some(window) = window_id.and_then(|id| linux_desktop::find(id).ok().flatten()) {
+            if window.width > 0 && window.height > 0 {
+                let geometry = format!("{},{} {}x{}", window.x, window.y, window.width, window.height);
+                if attempt("grim", &["-g", &geometry, &file], path, tried) {
+                    return true;
+                }
             }
         }
-        // Try grim (works on wlroots compositors)
-        if Command::new("grim")
-            .arg(tmp_path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            if std::path::Path::new(tmp_path).exists() {
-                return true;
-            }
-        }
-        // Fall back to scrot via XWayland
-        Command::new("scrot")
-            .arg(tmp_path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        attempt("grim", &[&file], path, tried)
+            || attempt("gnome-screenshot", &["-f", &file], path, tried)
+            || attempt("python3", &["-c", PORTAL_SCRIPT, &file], path, tried)
     }
 
-    fn capture_x11(tmp_path: &str, window_id: Option<u32>, target_app: &Option<String>) -> bool {
-        if let Some(wid) = window_id {
-            if Command::new("import")
-                .args(["-window", &wid.to_string(), tmp_path])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
+    fn capture_x11(path: &Path, window_id: Option<u32>, target_app: &Option<String>, tried: &mut Vec<String>) -> bool {
+        let file = path.to_string_lossy();
+        if let Some(id) = window_id {
+            if attempt("import", &["-window", &id.to_string(), &file], path, tried) {
                 return true;
             }
         }
-        if target_app.is_some() {
-            if Command::new("scrot")
-                .args(["-u", tmp_path])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return true;
-            }
+        if target_app.is_some() && attempt("scrot", &["-u", &file], path, tried) {
+            return true;
         }
-        Command::new("scrot")
-            .arg(tmp_path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            || Command::new("gnome-screenshot")
-                .args(["-f", tmp_path])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            || Command::new("import")
-                .args(["-window", "root", tmp_path])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+        attempt("scrot", &[&file], path, tried)
+            || attempt("gnome-screenshot", &["-f", &file], path, tried)
+            || attempt("import", &["-window", "root", &file], path, tried)
+    }
+
+    /// 7.7.0 (L3): JPEG at the requested quality (it was always the encoder's default).
+    fn encode(image: &image::DynamicImage, quality: u32) -> napi::Result<(Vec<u8>, &'static str)> {
+        let mut buf = Vec::new();
+        if quality == 0 {
+            image
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .map_err(|e| napi::Error::from_reason(format!("png encode: {e}")))?;
+            return Ok((buf, "image/png"));
+        }
+        let rgb = image.to_rgb8();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.clamp(1, 100) as u8)
+            .encode_image(&rgb)
+            .map_err(|e| napi::Error::from_reason(format!("jpeg encode: {e}")))?;
+        Ok((buf, "image/jpeg"))
     }
 
     #[napi]
@@ -95,59 +119,42 @@ mod linux {
         previous_hash: Option<String>,
         window_id: Option<u32>,
     ) -> napi::Result<serde_json::Value> {
-        let temporary = tempfile::Builder::new()
+        // A fresh path in a private directory: a tool handed an existing file (scrot) writes beside it instead.
+        let directory = tempfile::Builder::new()
             .prefix("cu-mcp-shot-")
-            .suffix(".png")
-            .tempfile()
-            .map_err(|e| napi::Error::from_reason(format!("temp file: {e}")))?;
-        let tmp_path = temporary.path().to_string_lossy().into_owned();
+            .tempdir()
+            .map_err(|e| napi::Error::from_reason(format!("temp dir: {e}")))?;
+        let path = directory.path().join("shot.png");
 
-        let captured = if is_wayland() {
-            capture_wayland(&tmp_path, window_id)
+        let mut tried = Vec::new();
+        let captured = if linux_desktop::is_wayland() {
+            capture_wayland(&path, window_id, &mut tried)
         } else {
-            capture_x11(&tmp_path, window_id, &target_app)
+            capture_x11(&path, window_id, &target_app, &mut tried)
         };
-
-        if !captured || !std::path::Path::new(&tmp_path).exists() {
-            return Err(napi::Error::from_reason(
-                "Screenshot failed: install scrot, gnome-screenshot, or grim",
-            ));
+        if !captured {
+            return Err(napi::Error::from_reason(format!(
+                "Screenshot failed. Tried: {}. Install {}.",
+                tried.join("; "),
+                if linux_desktop::is_wayland() {
+                    "grim (sway, Hyprland), or python3-gi for the desktop portal (GNOME, KDE)"
+                } else {
+                    "scrot or ImageMagick (import)"
+                }
+            )));
         }
 
-        let raw =
-            std::fs::read(&tmp_path).map_err(|e| napi::Error::from_reason(format!("read: {e}")))?;
-
-        let img = image::load_from_memory(&raw)
-            .map_err(|e| napi::Error::from_reason(format!("decode: {e}")))?;
+        let raw = std::fs::read(&path).map_err(|e| napi::Error::from_reason(format!("read: {e}")))?;
+        let img = image::load_from_memory(&raw).map_err(|e| napi::Error::from_reason(format!("decode: {e}")))?;
 
         let target_width = width.unwrap_or(1024);
         let resized = if img.width() > target_width {
-            img.resize(
-                target_width,
-                u32::MAX,
-                image::imageops::FilterType::Lanczos3,
-            )
+            img.resize(target_width, u32::MAX, image::imageops::FilterType::Lanczos3)
         } else {
             img
         };
 
-        let q = quality.unwrap_or(80);
-        let (encoded, mime) = if q == 0 {
-            let mut buf = Vec::new();
-            resized
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-                .map_err(|e| napi::Error::from_reason(format!("png encode: {e}")))?;
-            (buf, "image/png")
-        } else {
-            let mut buf = Vec::new();
-            resized
-                .write_to(
-                    &mut std::io::Cursor::new(&mut buf),
-                    image::ImageFormat::Jpeg,
-                )
-                .map_err(|e| napi::Error::from_reason(format!("jpeg encode: {e}")))?;
-            (buf, "image/jpeg")
-        };
+        let (encoded, mime) = encode(&resized, quality.unwrap_or(80))?;
 
         let mut hasher = DefaultHasher::new();
         encoded.hash(&mut hasher);
@@ -217,20 +224,8 @@ mod linux {
         let width = cropped.width();
         let height = cropped.height();
 
-        let q = quality.unwrap_or(0);
-        let mut buf = Vec::new();
-        let mime = if q == 0 {
-            cropped
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-                .map_err(|e| napi::Error::from_reason(format!("png encode: {e}")))?;
-            "image/png"
-        } else {
-            // JPEG has no alpha, so drop it rather than letting the encoder refuse.
-            image::DynamicImage::ImageRgb8(cropped.to_rgb8())
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
-                .map_err(|e| napi::Error::from_reason(format!("jpeg encode: {e}")))?;
-            "image/jpeg"
-        };
+        // JPEG has no alpha; `encode` converts to RGB and honours the quality (L3).
+        let (buf, mime) = encode(&cropped, quality.unwrap_or(0))?;
 
         Ok(serde_json::json!({
             "base64": base64::engine::general_purpose::STANDARD.encode(&buf),

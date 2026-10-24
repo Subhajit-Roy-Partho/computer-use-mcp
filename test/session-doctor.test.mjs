@@ -143,3 +143,41 @@ test('Windows doctor never consults the macOS-only permission probe', async () =
   assert.equal(result.ok, true)
   assert.equal(result.checks.find(check => check.id === 'ui_automation').status, 'pass')
 })
+
+// ── 7.7.0 (K7): Linux passes the platform check and names its backends ──
+
+test('Linux passes the platform check and doctor names the window, capture and input backends', async () => {
+  const backends = { session: 'wayland', compositor: 'sway', windowList: 'swaymsg', screenshot: 'grim', screenshotPortal: true, input: 'ydotool' }
+  const result = await runDoctor(options({
+    platform: 'linux', includeRemediation: true,
+    native: native({ getLinuxBackends: () => backends }),
+  }))
+  assert.equal(result.checks.find(check => check.id === 'platform').status, 'pass', 'Linux used to fail this check')
+  const linux = result.checks.find(check => check.id === 'linux_backends')
+  assert.equal(linux.status, 'pass')
+  assert.match(linux.summary, /windows via swaymsg, capture via grim, input via ydotool/)
+  assert.deepEqual(linux.details, backends)
+})
+
+test('GNOME on Wayland with only XWayland windows, and no capture tool, is a warning that says what to install', async () => {
+  const result = await runDoctor(options({
+    platform: 'linux', includeRemediation: true,
+    native: native({ getLinuxBackends: () => ({ session: 'wayland', compositor: 'gnome', windowList: 'wmctrl-xwayland', screenshot: null, screenshotPortal: false, input: null }) }),
+  }))
+  const linux = result.checks.find(check => check.id === 'linux_backends')
+  assert.equal(linux.status, 'warn')
+  assert.ok(linux.remediation.some(line => /Shell\.Eval is disabled since GNOME 41/.test(line)))
+  assert.ok(linux.remediation.some(line => /python3-gi for the desktop portal/.test(line)))
+  assert.ok(linux.remediation.some(line => /ydotool/.test(line)))
+})
+
+test('a window list that failed is named in doctor', async () => {
+  const result = await runDoctor(options({
+    platform: 'linux', includeRemediation: true,
+    native: native({ getLinuxBackends: () => ({ session: 'x11', compositor: 'x11', windowList: { error: 'wmctrl is not installed: install wmctrl (apt install wmctrl / dnf install wmctrl)' }, screenshot: 'scrot', screenshotPortal: false, input: 'xdotool' }) }),
+  }))
+  const linux = result.checks.find(check => check.id === 'linux_backends')
+  assert.equal(linux.status, 'warn')
+  assert.match(linux.summary, /windows via nothing/)
+  assert.ok(linux.remediation.some(line => /wmctrl is not installed/.test(line)))
+})

@@ -9,6 +9,7 @@ mod display;
 mod dpi;
 mod keyboard;
 mod keychain;
+mod linux_desktop;
 #[cfg(target_os = "linux")]
 mod linux_tools;
 mod mouse;
