@@ -1,16 +1,21 @@
 #!/usr/bin/env node
-// Live integration test on a macOS desktop (7.6.1): the real native module, the desktop status card, a real app
-// driven through the server, the card's buttons pressed as a person would press them (raw native clicks, not tool
-// calls), and the card's absence from the agent's own screenshots. Run it on a Mac you are not using for the next
-// minute; it opens Calculator, computes 1 + 2, and quits it. Nothing is written outside the temp directory.
+// Live integration test on a macOS desktop (7.6.1; 7.7.0 checks added): the real native module, the desktop status
+// card (on by default since 7.7), a real app driven through the server, the card's buttons pressed as a person would
+// press them (raw native clicks, not tool calls), and the card's absence from the agent's own screenshots. 7.7 adds the
+// result contract, run_steps, a person taking over mid-action (mouse movement posted as hardware input) and Stop
+// during a hold_key. Run it on a Mac you are not using for the next two minutes; it opens Calculator, computes 1 + 2,
+// holds shift for a few seconds and quits it. Nothing is written outside the temp directory.
 //
 //   npm run build:ts && node scripts/integration-status-card.mjs
 import { writeFileSync, readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { execSync } from 'node:child_process'
+import { execFile, execSync } from 'node:child_process'
+import { promisify } from 'node:util'
 
-process.env.COMPUTER_USE_STATUS_CARD = 'true'
+// 7.7.0: the card is on by default on macOS; the test checks that default rather than setting it.
+delete process.env.COMPUTER_USE_STATUS_CARD
+const execFileAsync = promisify(execFile)
 const { createComputerUseServer } = await import('../dist/server.js')
 const { connectInProcess } = await import('../dist/client.js')
 const { loadNative } = await import('../dist/native.js')
@@ -25,6 +30,24 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const native = loadNative()
 const personClicks = (point) => { native.mouseMove(point.x, point.y); native.mouseClick(point.x, point.y, 'left', 1) }
 const centre = rect => ({ x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) })
+/** Is shift down right now, as the system sees it (JXA; no permission needed)? */
+const shiftDown = () => {
+  const flags = Number(execSync(`osascript -l JavaScript -e 'ObjC.import("AppKit"); $.NSEvent.modifierFlags'`, { encoding: 'utf8' }).trim())
+  return (flags & 0x20000) !== 0
+}
+/** A person moving the mouse: events posted with the HID system source, which the takeover watch counts as physical. */
+const PERSON_MOVES = `import CoreGraphics
+import Foundation
+let source = CGEventSource(stateID: .hidSystemState)
+var point = CGEvent(source: nil)!.location
+for _ in 0..<40 {
+    point.x += 15
+    let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)!
+    event.setIntegerValueField(.mouseEventDeltaX, value: 15)
+    event.post(tap: .cghidEventTap)
+    usleep(15_000)
+}
+`
 
 const server = createComputerUseServer({ profile: 'full' })
 const client = await connectInProcess(server)
@@ -67,7 +90,7 @@ try {
   // 3. The card launched on the first desktop action, and says what happened.
   let status
   for (let i = 0; i < 40 && !(status?.card?.launched || status?.card?.error); i++) { status = parse(await client.callTool('control_status', {})); await sleep(250) }
-  check('status card launched', status?.card?.launched === true, JSON.stringify(status?.card))
+  check('status card launched by default (7.7, macOS)', status?.card?.launched === true, JSON.stringify(status?.card))
   cardDir = status?.card?.directory
   let card
   for (let i = 0; i < 20 && !card; i++) { try { card = JSON.parse(readFileSync(join(cardDir, 'card.json'), 'utf8')) } catch { await sleep(200) } }
@@ -81,10 +104,13 @@ try {
   const pick = re => labels.find(l => re.test(l))
   const keys = [pick(/^1$/), pick(/^(\+|add)$/i), pick(/^2$/), pick(/^(=|equals?)$/i)]
   check('the four keys are found', keys.every(Boolean), keys.join(' '))
-  for (const label of keys) {
-    const pressed = await whenIdle('press_button', { window_id: windowId, label })
-    if (pressed.isError) check(`press ${label}`, false, text(pressed).slice(0, 120))
-  }
+  // 7.7.0 (K2): the four presses as one run_steps call; (K1) the reply says what happened.
+  const steps = await whenIdle('run_steps', { target_window_id: windowId, steps: keys.map(label => ({ tool: 'press_button', args: { window_id: windowId, label } })) })
+  const batch = parse(steps)
+  check('run_steps pressed 1 + 2 = in one call', !steps.isError && batch.completed === keys.length, text(steps).slice(0, 160))
+  check('run_steps reports its route and effect', batch.route === 'batch' && typeof batch.effect === 'string', `route ${batch.route}, effect ${batch.effect}`)
+  const activated = parse(await whenIdle('activate_app', { bundle_id: CALC }))
+  check('an activation reports effect: verified', activated.effect === 'verified', `effect ${activated.effect}`)
   await sleep(700)
   // The result, two ways: the accessibility value of the display, and the OCR of the window.
   const statics = parse(await client.callTool('find_element', { window_id: windowId, role: 'AXStaticText', max_results: 50 }))
@@ -126,13 +152,40 @@ try {
   check('the card is absent from the screenshot', cardWords.length === 0, cardWords.join(' | ') || 'no card text found')
   check('screenshot ignored the session target (full_screen)', /screen \d+x\d+/.test(text(shot)) && !/window \d+ at/.test(text(shot)), text(shot).split('\n')[0])
 
-  // 7. Quit Calculator through the server, then Stop from the card.
+  // 7. 7.7.0 (K5): a person taking over mid-action pauses the agent, and it resumes once they stop.
+  const holdStarted = Date.now()
+  const held = whenIdle('hold_key', { keys: ['shift'], duration: 6, target_app: CALC })
+  await sleep(700)
+  await execFileAsync('xcrun', ['swift', '-'], { input: PERSON_MOVES }).catch(async () => {
+    const file = join(scratch, 'person.swift')
+    writeFileSync(file, PERSON_MOVES)
+    await execFileAsync('xcrun', ['swift', file])
+  })
+  const heldResult = await held
+  const heldFor = Date.now() - holdStarted
+  status = parse(await client.callTool('control_status', {}))
+  check('taking over pauses the agent', status.state === 'paused' && status.reason === 'takeover', `state ${status.state} (${status.reason})`)
+  check('the hold ended early, not after 6 s', heldResult.isError === true && heldFor < 5500, `${heldFor} ms: ${text(heldResult).slice(0, 80)}`)
+  check('shift came back up', !shiftDown())
+  const whileTaken = parse(await client.callTool('press_button', { window_id: windowId, label: keys[0] }))
+  check('a mutation is refused while taken over', whileTaken.error === 'taken_over' && typeof whileTaken.hint === 'string', `${whileTaken.error}: ${whileTaken.hint ?? ''}`)
+  for (let i = 0; i < 40 && status.state !== 'running'; i++) { await sleep(250); status = parse(await client.callTool('control_status', {})) }
+  check('the agent resumes by itself after the person stops', status.state === 'running', `state ${status.state}`)
+
+  // 8. Quit Calculator through the server, then Stop from the card during a hold.
   const quit = await whenIdle('key', { text: 'command+q', target_app: CALC })
   check('Calculator quit through the server', !quit.isError, text(quit).slice(0, 60))
   const gone = parse(await client.callTool('wait_for_window', { target_app: CALC, gone: true, timeout_ms: 8000 }))
   check('Calculator window gone', gone.gone === true)
+  const stopHoldStarted = Date.now()
+  const stopHold = whenIdle('hold_key', { keys: ['shift'], duration: 6, target_app: 'com.apple.finder' })
+  await sleep(800)
   personClicks(centre(card.buttons.stop))
-  await sleep(600)
+  const stopHoldResult = await stopHold
+  const stopHeldFor = Date.now() - stopHoldStarted
+  check('Stop ends a hold in progress', stopHoldResult.isError === true && stopHeldFor < 3000, `${stopHeldFor} ms: ${text(stopHoldResult).slice(0, 80)}`)
+  check('shift is up after Stop', !shiftDown())
+  await sleep(300)
   status = parse(await client.callTool('control_status', {}))
   check('Stop button stops the agent', status.state === 'stopped', `state ${status.state}`)
   check('Stop tripped the native emergency-stop latch', status.emergencyStop?.latched === true)
