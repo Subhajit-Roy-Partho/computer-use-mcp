@@ -217,7 +217,7 @@ jobs:
         shell: bash
         run: cp ${{ matrix.os.binary }} computer-use-napi.node
 
-      - name: Build TypeScript through the package script (7.7.0: proves build:ts works on every OS)
+      - name: Build TypeScript through the package script (proves build:ts works on every OS)
         run: npm run build:ts
 
       - name: Verify the current source build addon loads
