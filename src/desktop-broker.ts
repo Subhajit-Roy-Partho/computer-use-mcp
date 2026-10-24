@@ -1,4 +1,4 @@
-import { MUTATING_TOOLS } from './tool-catalog.js'
+import { callMutates } from './tool-catalog.js'
 import type { TaskStore } from './task-store.js'
 import { randomUUID } from 'node:crypto'
 import type { Session } from './session.js'
@@ -87,9 +87,10 @@ export class DesktopBroker {
     const record = this.#get(owner, id)
     return {
       dispatch: (tool, args, signal, progress, context) => {
-        if (MUTATING_TOOLS.has(tool) && record.paused) return Promise.resolve({ isError: true, content: [{ type: 'text', text: 'Desktop session paused' }] })
+        const mutates = callMutates(tool, args)
+        if (mutates && record.paused) return Promise.resolve({ isError: true, content: [{ type: 'text', text: 'Desktop session paused' }] })
         const combined = signal ? AbortSignal.any([signal, record.controller.signal]) : record.controller.signal
-        return record.session.dispatch(tool, args, MUTATING_TOOLS.has(tool) ? combined : signal, progress, context)
+        return record.session.dispatch(tool, args, mutates ? combined : signal, progress, context)
       },
       preflight: record.session.preflight?.bind(record.session),
       retain: record.session.retain?.bind(record.session),

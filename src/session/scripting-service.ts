@@ -3,6 +3,9 @@ import type { NativeModule } from '../native.js'
 import { parseSdef, type ScriptingDictionary } from './scripting-dictionary.js'
 import type { SpawnBounded, SpawnResult } from './spawn.js'
 
+/** Makes Windows PowerShell write UTF-8 (no BOM) to its stdout and to native commands it pipes to (7.7.0, W6). */
+export const POWERSHELL_UTF8_PREFIX = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
+
 /** Cross-platform script execution and PID-aware macOS dictionary discovery. */
 export class ScriptingService {
   readonly #native: NativeModule
@@ -109,12 +112,13 @@ export class ScriptingService {
       case 'powershell': {
         // Present on all three: Windows ships it, and pwsh is installable elsewhere.
         const executable = this.#platform === 'win32' ? this.getPowerShellExe() : 'pwsh'
-        // Quoting a script through -Command is where this used to break on Windows, so
-        // anything with a quote, a dollar or a newline goes base64 instead.
-        if (this.#platform === 'win32' && /['"$`\r\n]/.test(script)) {
+        // 7.7.0 (W6): Windows PowerShell writes the console's OEM code page, so non-ASCII output arrived garbled on
+        // most non-English systems. Every Windows script runs base64-encoded (no quoting through -Command at all) with
+        // the output encoding set to UTF-8 first.
+        if (this.#platform === 'win32') {
           return this.#spawn(executable, [
             '-NoProfile', '-NonInteractive', '-EncodedCommand',
-            Buffer.from(script, 'utf16le').toString('base64'),
+            Buffer.from(POWERSHELL_UTF8_PREFIX + script, 'utf16le').toString('base64'),
           ], timeoutMs, signal)
         }
         return this.#spawn(

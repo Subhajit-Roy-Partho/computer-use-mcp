@@ -129,24 +129,25 @@ mod macos {
 #[cfg(target_os = "windows")]
 mod win {
     use napi_derive::napi;
-    use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+    use windows::Win32::Foundation::{BOOL, LPARAM, POINT, RECT, TRUE};
     use windows::Win32::Graphics::Gdi::*;
 
-    struct MonitorInfo {
-        handle: isize,
-        rect: RECT,
-        dpi_x: u32,
-        dpi_y: u32,
+    pub(crate) struct MonitorInfo {
+        pub handle: isize,
+        pub rect: RECT,
+        pub dpi_x: u32,
+        pub primary: bool,
     }
 
-    fn enumerate_monitors() -> Vec<MonitorInfo> {
+    pub(crate) fn enumerate_monitors() -> Vec<MonitorInfo> {
         use windows::Win32::UI::HiDpi::*;
+        crate::dpi::ensure();
         let mut monitors: Vec<MonitorInfo> = Vec::new();
         let ptr = LPARAM(&mut monitors as *mut Vec<MonitorInfo> as isize);
         unsafe {
             let _ = EnumDisplayMonitors(None, None, Some(enum_cb), ptr);
         }
-        // Fill DPI
+        let primary = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
         for m in &mut monitors {
             let hmon = HMONITOR(m.handle as *mut _);
             let mut dx: u32 = 96;
@@ -155,8 +156,11 @@ mod win {
                 let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             }
             m.dpi_x = dx;
-            m.dpi_y = dy;
+            m.primary = hmon == primary;
         }
+        // The primary first, so callers that take the first monitor take the one at (0, 0) (7.7.0: EnumDisplayMonitors
+        // gives no order, and the first one was not always the primary).
+        monitors.sort_by_key(|m| !m.primary);
         monitors
     }
 
@@ -171,53 +175,43 @@ mod win {
             handle: hmon.0 as isize,
             rect: *rect,
             dpi_x: 96,
-            dpi_y: 96,
+            primary: false,
         });
         TRUE
+    }
+
+    /// 7.7.0 (K6): with per-monitor DPI awareness the rectangle is in physical pixels, which is also the space input,
+    /// window bounds, captures and UI Automation use, so width and pixelWidth agree and scaleFactor is informational.
+    /// Without it (the opt-out) the rectangle is virtualised to 96 DPI, as before.
+    fn describe(m: &MonitorInfo) -> serde_json::Value {
+        let w = (m.rect.right - m.rect.left) as u64;
+        let h = (m.rect.bottom - m.rect.top) as u64;
+        let scale = m.dpi_x as f64 / 96.0;
+        let physical = crate::dpi::per_monitor_aware();
+        let (pw, ph) = if physical { (w, h) } else { ((w as f64 * scale) as u64, (h as f64 * scale) as u64) };
+        serde_json::json!({
+            "width": w, "height": h, "x": m.rect.left, "y": m.rect.top,
+            "pixelWidth": pw, "pixelHeight": ph,
+            "scaleFactor": scale,
+            "displayId": m.handle,
+            "primary": m.primary,
+            "coordinateSpace": if physical { "physical_pixels" } else { "virtualized_96dpi" },
+        })
     }
 
     #[napi]
     pub fn get_display_size(display_id: Option<u32>) -> napi::Result<serde_json::Value> {
         let monitors = enumerate_monitors();
-        let m = if let Some(id) = display_id {
-            monitors
-                .iter()
-                .find(|m| m.handle as u32 == id)
-                .or(monitors.first())
-        } else {
-            monitors.first()
+        let m = match display_id {
+            Some(id) => monitors.iter().find(|m| m.handle as u32 == id).or(monitors.first()),
+            None => monitors.first(),
         };
         let m = m.ok_or_else(|| napi::Error::from_reason("No display found"))?;
-        let w = (m.rect.right - m.rect.left) as u64;
-        let h = (m.rect.bottom - m.rect.top) as u64;
-        let scale = m.dpi_x as f64 / 96.0;
-        let pw = (w as f64 * scale) as u64;
-        let ph = (h as f64 * scale) as u64;
-        Ok(serde_json::json!({
-            "width": w, "height": h, "x": m.rect.left, "y": m.rect.top,
-            "pixelWidth": pw, "pixelHeight": ph,
-            "scaleFactor": scale,
-            "displayId": m.handle,
-        }))
+        Ok(describe(m))
     }
 
     #[napi]
     pub fn list_displays() -> napi::Result<serde_json::Value> {
-        let monitors = enumerate_monitors();
-        let mut result = Vec::new();
-        for m in &monitors {
-            let w = (m.rect.right - m.rect.left) as u64;
-            let h = (m.rect.bottom - m.rect.top) as u64;
-            let scale = m.dpi_x as f64 / 96.0;
-            let pw = (w as f64 * scale) as u64;
-            let ph = (h as f64 * scale) as u64;
-            result.push(serde_json::json!({
-                "width": w, "height": h, "x": m.rect.left, "y": m.rect.top,
-                "pixelWidth": pw, "pixelHeight": ph,
-                "scaleFactor": scale,
-                "displayId": m.handle,
-            }));
-        }
-        Ok(serde_json::json!(result))
+        Ok(serde_json::json!(enumerate_monitors().iter().map(describe).collect::<Vec<_>>()))
     }
 }

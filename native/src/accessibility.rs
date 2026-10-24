@@ -9,7 +9,7 @@ mod platform {
     #[napi]
     pub fn get_ui_tree(
         _window_id: u32,
-        _max_depth: Option<u32>,
+        _max_depth: Option<i32>,
     ) -> napi::Result<serde_json::Value> {
         Err(napi::Error::from_reason("Linux accessibility requires the MCP AT-SPI bridge (python3-gi + gir1.2-atspi-2.0)"))
     }
@@ -25,7 +25,7 @@ mod platform {
         _role: Option<String>,
         _label: Option<String>,
         _value: Option<String>,
-        _max_results: Option<u32>,
+        _max_results: Option<i32>,
     ) -> napi::Result<serde_json::Value> {
         Err(napi::Error::from_reason("Linux accessibility requires the MCP AT-SPI bridge"))
     }
@@ -517,4 +517,32 @@ mod platform {
             serde_json::json!({"pressed": false, "reason": "windows_menu_navigation_not_yet_implemented"}),
         )
     }
+}
+
+// ── 7.7.0 (K4): the walks on a worker thread ─────────────────────────────────
+// A walk of a large window takes seconds. These resolve a promise with what the synchronous call returns, so the
+// JavaScript thread (and the status card's Stop) is never held by one.
+
+#[napi_derive::napi]
+pub fn get_ui_tree_async(
+    window_id: u32,
+    max_depth: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || platform::get_ui_tree(window_id, max_depth))
+}
+
+#[napi_derive::napi]
+pub fn find_element_async(
+    window_id: u32,
+    role: Option<String>,
+    label: Option<String>,
+    value: Option<String>,
+    max_results: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || platform::find_element(window_id, role, label, value, max_results))
+}
+
+#[napi_derive::napi]
+pub fn get_menu_bar_async(bundle_id: String) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || platform::get_menu_bar(bundle_id))
 }

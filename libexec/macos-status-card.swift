@@ -27,6 +27,18 @@ struct CardFrame: Decodable {
     let recent: [CardAction]
     let waiting: String?
     let chord: String?
+    /// 7.7.0: "takeover" when the person used the mouse or keyboard during an action.
+    let reason: String?
+}
+
+/// "ctrl+alt+escape" as the keys read on a Mac keyboard: ⌃⌥⎋.
+func chordLabel(_ chord: String?) -> String? {
+    guard let chord = chord, !chord.isEmpty else { return nil }
+    let symbols: [String: String] = [
+        "ctrl": "⌃", "control": "⌃", "alt": "⌥", "option": "⌥", "shift": "⇧", "cmd": "⌘", "command": "⌘", "meta": "⌘",
+        "escape": "⎋", "esc": "⎋", "f12": "F12",
+    ]
+    return chord.split(separator: "+").map { symbols[$0.lowercased()] ?? $0.uppercased() }.joined()
 }
 
 let arguments = CommandLine.arguments
@@ -226,8 +238,13 @@ final class Card {
             stopButton.isEnabled = false
         case "paused":
             dot.layer?.backgroundColor = NSColor.systemOrange.cgColor
-            title.stringValue = "Agent paused · \(elapsed)"
-            action.stringValue = "Mutations are refused; it can still look. Resume when you are ready."
+            if frame?.reason == "takeover" {
+                title.stringValue = "You took over · \(elapsed)"
+                action.stringValue = "The agent waits while you use the mouse or keyboard, and resumes when you stop."
+            } else {
+                title.stringValue = "Agent paused · \(elapsed)"
+                action.stringValue = "Mutations are refused; it can still look. Resume when you are ready."
+            }
             pauseButton.title = "Resume"
             pauseButton.isEnabled = true
             stopButton.isEnabled = true
@@ -246,9 +263,12 @@ final class Card {
             } else {
                 dot.layer?.backgroundColor = NSColor.systemBlue.cgColor
                 title.stringValue = "Agent is using this Mac · \(elapsed)"
-                action.stringValue = current(frame) ?? "Idle"
+                let keys = chordLabel(frame?.chord)
+                action.stringValue = current(frame) ?? (keys.map { "Idle · \($0) stops it from any app" } ?? "Idle")
             }
         }
+        stopButton.toolTip = chordLabel(frame?.chord).map { "Stop the agent for this session (or press \($0) anywhere)" }
+            ?? "Stop the agent for this session"
         let recent = frame?.recent ?? []
         for (index, line) in recentLines.enumerated() {
             if index < recent.count {

@@ -58,6 +58,23 @@ windows = { version = "0.58", features = [
     "Win32_System_Variant",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
+    # 7.7.0: visible window bounds and cloaking (W4, K6)
+    "Win32_Graphics_Dwm",
+    # 7.7.0: PrintWindow (the windows crate files it under XPS)
+    "Win32_Storage_Xps",
+    # 7.7.0: Windows.Graphics.Capture for windows PrintWindow cannot draw (K6)
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # 7.7.0: locked screen, disconnected session and display-awake (K5)
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Power",
 ] }
 
 [build-dependencies]

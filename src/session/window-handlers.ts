@@ -1,4 +1,5 @@
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import { errJson, ok, okJson, okJsonWrappedArray, platformUnsupported, type ToolResult } from '../result.js'
 import { PROVIDER_WIDTH } from './constants.js'
 import type { SpawnResult } from './spawn.js'
@@ -85,7 +86,7 @@ export async function handleWindowTool(
     const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : undefined
     guardActivation(bundleId, `activate ${bundleId}`)
     const frontmostBefore = native.getFrontmostApp()
-    const result = native.activateApp(bundleId, timeoutMs ?? 2_000)
+    const result = await offThread(native, 'activateApp', bundleId, timeoutMs ?? 2_000)
     await context.sleep(80)
     const frontmostAfter = native.getFrontmostApp()
     const activated = result.activated || frontmostAfter?.bundleId === bundleId
@@ -98,14 +99,20 @@ export async function handleWindowTool(
       else if (running.isHidden) { reason = 'hidden'; suggestedRecovery = 'unhide_app' }
       else reason = 'timeout'
     }
-    return ok(JSON.stringify({
+    const payload = {
       requestedBundleId: bundleId,
       frontmostBefore: frontmostBefore?.bundleId ?? null,
       frontmostAfter: frontmostAfter?.bundleId ?? null,
       activated,
       reason,
       ...(suggestedRecovery ? { suggestedRecovery } : {}),
-    }))
+    }
+    // 7.7.0 (K1): an activation confirmed by the frontmost app is verified; one that did not happen says so.
+    return { ...okJson(payload), contract: activated ? { effect: 'verified' } : {
+      effect: 'no_visible_change',
+      hint: suggestedRecovery === 'unhide_app' ? 'The app is hidden: unhide_app, then activate it again.'
+        : reason === 'not_running' ? 'The app is not running: open_application starts it.' : 'The app did not come to the front; check what is in front, then retry.',
+    } }
   }
 
   if (tool === 'activate_window') {
@@ -127,10 +134,10 @@ export async function handleWindowTool(
         native.unhideApp(bundleId)
         await context.sleep(100)
       }
-      native.activateApp(bundleId, timeoutMs ?? 2_000)
+      await offThread(native, 'activateApp', bundleId, timeoutMs ?? 2_000)
       await context.sleep(80)
     }
-    const result = native.activateWindow(windowId, timeoutMs)
+    const result = await offThread(native, 'activateWindow', windowId, timeoutMs)
     await context.sleep(80)
     if (result.activated && bundleId) targets.update({ bundleId, windowId }, 'activation')
     const payload = {
@@ -139,13 +146,13 @@ export async function handleWindowTool(
       frontmostAfter: native.getFrontmostApp()?.bundleId ?? null,
       reason: result.reason,
     }
-    return result.activated ? okJson(payload) : errJson({ error: 'activation_failed', ...payload })
+    return result.activated ? { ...okJson(payload), contract: { effect: 'verified' } } : errJson({ error: 'activation_failed', ...payload })
   }
 
   if (tool === 'open_application') {
     const bundleId = stringArg(args, 'bundle_id')
     guardActivation(bundleId, `open and focus ${bundleId}`)
-    const result = native.activateApp(bundleId, 3_000)
+    const result = await offThread(native, 'activateApp', bundleId, 3_000)
     if (result.activated) targets.update({ bundleId }, 'activation')
     await context.sleep(300)
     if (!result.activated) {
@@ -160,7 +167,7 @@ export async function handleWindowTool(
           : 'Use activate_app for diagnostics, unhide_app if it is hidden, or wait_for_window for its window.'],
       })
     }
-    return ok(`Opened ${bundleId} (activated: true)`)
+    return { ...ok(`Opened ${bundleId} (activated: true)`), contract: { effect: 'verified' } }
   }
   if (tool === 'get_frontmost_app') return okJson({ app: native.getFrontmostApp() ?? null })
   if (tool === 'list_windows') {
@@ -264,14 +271,14 @@ export async function handleWindowTool(
         ? windows.find(window => window.windowId === targetWindowId)
         : windows.find(window => window.isFocused)
       if (focused) {
-        try { desktop += `\n\nUI Tree (${focused.bundleId}):\n${JSON.stringify(native.getUiTree(focused.windowId, 5)).slice(0, 4000)}` }
+        try { desktop += `\n\nUI Tree (${focused.bundleId}):\n${JSON.stringify(await offThread(native, 'getUiTree', focused.windowId, 5)).slice(0, 4000)}` }
         catch { /* semantic capture is best effort */ }
       }
     }
     content.push({ type: 'text', text: desktop })
     if (args.use_vision) {
       const width = typeof args.width === 'number' ? args.width : PROVIDER_WIDTH[context.defaultProvider] ?? 1024
-      const screenshot = native.takeScreenshot(width, undefined, 80, undefined, targetWindowId)
+      const screenshot = await offThread(native, 'takeScreenshot', width, undefined, 80, undefined, targetWindowId)
       if (screenshot.base64) {
         // Window annotations are drawn in screen space, so only on a screen capture.
         const annotate = args.use_annotation && Array.isArray(windows) && targetWindowId === undefined

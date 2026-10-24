@@ -254,6 +254,8 @@ export function createComputerUseServer(opts: ServerOptions = {}): McpServer {
     elicitApproval: opts.elicitApproval !== undefined ? opts.elicitApproval : elicitApproval,
     profile,
     getClientRoots: () => mcp.clientRoots(),
+    // 7.7.0 (K2): run_steps validates each step exactly as a direct call; the registry is built just below.
+    validateArguments: (tool, args) => registry.validateArguments(tool, args),
   })
 
   const registry: ToolRegistry = new ToolRegistry({

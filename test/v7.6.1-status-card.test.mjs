@@ -124,11 +124,13 @@ test('control_status is a core read-only tool on every platform, and the instruc
   assert.match(buildInstructions('darwin', 'desktop'), /paused_by_user or stopped_by_user/)
 })
 
-test('the card is opt-in in 7.6.1', () => {
-  assert.equal(statusCardEnabled({}), false)
-  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: 'true' }), true)
-  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: '1' }), true)
-  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: 'false' }), false)
+test('the card was opt-in in 7.6.1; 7.7.0 turns it on by default on macOS only', () => {
+  assert.equal(statusCardEnabled({}, 'win32'), false)
+  assert.equal(statusCardEnabled({}, 'linux'), false)
+  assert.equal(statusCardEnabled({}, 'darwin'), true)
+  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: 'true' }, 'win32'), true)
+  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: '1' }, 'win32'), true)
+  assert.equal(statusCardEnabled({ COMPUTER_USE_STATUS_CARD: 'false' }, 'darwin'), false)
 })
 
 test('a presenter that fails to start never breaks a tool call; the status says why', async () => {

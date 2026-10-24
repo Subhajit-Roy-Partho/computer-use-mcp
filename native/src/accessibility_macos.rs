@@ -57,6 +57,7 @@ extern "C" {
         value: *mut RawCFTypeRef,
     ) -> AXError;
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f32) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
     fn AXUIElementSetAttributeValue(
         element: AXUIElementRef,
@@ -101,6 +102,21 @@ fn ax_error_to_reason(err: AXError) -> String {
 
 fn is_permission_error(err: AXError) -> bool {
     err == K_AX_ERROR_NOT_AUTHORIZED || err == K_AX_ERROR_API_DISABLED
+}
+
+/// 7.7.0 (M1): how long one accessibility message may wait for the app. The system default is six seconds a message,
+/// so a walk of a hung app (hundreds of messages) did not come back. The timeout belongs to the element reference and
+/// children do not inherit it, so every element a walk reaches is bounded on the way in.
+const AX_MESSAGING_TIMEOUT_S: f32 = 0.5;
+
+/// 7.7.0 (M1): a whole walk stops after this long and says so.
+const WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn bounded(elem: AXUIElementRef) -> AXUIElementRef {
+    if !elem.is_null() {
+        unsafe { AXUIElementSetMessagingTimeout(elem, AX_MESSAGING_TIMEOUT_S) };
+    }
+    elem
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +356,7 @@ fn ax_copy_children(elem: AXUIElementRef) -> Option<(RawCFTypeRef, Vec<AXUIEleme
     for i in 0..count {
         let child = unsafe { CFArrayGetValueAtIndex(arr, i) } as AXUIElementRef;
         if !child.is_null() {
-            out.push(child);
+            out.push(bounded(child));
         }
     }
     Some((val, out))
@@ -418,7 +434,7 @@ fn ax_app_and_window_for_cg_window(
     };
 
     // Step 2: AXApp + enumerate AXWindows.
-    let ax_app = unsafe { AXUIElementCreateApplication(pid) };
+    let ax_app = bounded(unsafe { AXUIElementCreateApplication(pid) });
     if ax_app.is_null() {
         return Ok(None);
     }
@@ -441,7 +457,7 @@ fn ax_app_and_window_for_cg_window(
 
     let mut matched: Option<AXUIElementRef> = None;
     for i in 0..count {
-        let w = unsafe { CFArrayGetValueAtIndex(arr, i as isize) } as AXUIElementRef;
+        let w = bounded(unsafe { CFArrayGetValueAtIndex(arr, i as isize) } as AXUIElementRef);
         if w.is_null() {
             continue;
         }
@@ -516,6 +532,27 @@ const VALUE_TRUNCATE_LEN: usize = 500;
 struct WalkState {
     node_count: usize,
     truncated_at_cap: bool,
+    deadline: std::time::Instant,
+    timed_out: bool,
+}
+
+impl WalkState {
+    fn new() -> Self {
+        WalkState {
+            node_count: 0,
+            truncated_at_cap: false,
+            deadline: std::time::Instant::now() + WALK_BUDGET,
+            timed_out: false,
+        }
+    }
+
+    /// Past the walk budget: stop here, and remember why.
+    fn expired(&mut self) -> bool {
+        if !self.timed_out && std::time::Instant::now() >= self.deadline {
+            self.timed_out = true;
+        }
+        self.timed_out
+    }
 }
 
 fn node_value_of(elem: AXUIElementRef) -> Option<String> {
@@ -576,7 +613,7 @@ fn build_node(
     max_depth: i32,
     state: &mut WalkState,
 ) -> serde_json::Value {
-    if state.node_count >= NODE_LIMIT {
+    if state.node_count >= NODE_LIMIT || state.expired() {
         state.truncated_at_cap = true;
         return serde_json::json!({ "truncated": true });
     }
@@ -602,7 +639,7 @@ fn build_node(
                 // Discard children entirely.
             } else {
                 for child in &kids {
-                    if state.node_count >= NODE_LIMIT {
+                    if state.node_count >= NODE_LIMIT || state.expired() {
                         state.truncated_at_cap = true;
                         break;
                     }
@@ -670,6 +707,7 @@ fn value_matches(actual: Option<&str>, expected: &str) -> bool {
     a.to_lowercase().contains(&expected.to_lowercase())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_visit(
     elem: AXUIElementRef,
     role: Option<&str>,
@@ -679,8 +717,9 @@ fn find_visit(
     path: &mut Vec<usize>,
     out: &mut Vec<serde_json::Value>,
     depth: i32,
+    state: &mut WalkState,
 ) {
-    if out.len() >= max_results {
+    if out.len() >= max_results || state.expired() {
         return;
     }
     let actual_role = ax_copy_string(elem, "AXRole").unwrap_or_else(|| "AXUnknown".into());
@@ -727,7 +766,7 @@ fn find_visit(
                 break;
             }
             path.push(i);
-            find_visit(*c, role, label, value, max_results, path, out, depth + 1);
+            find_visit(*c, role, label, value, max_results, path, out, depth + 1, state);
             path.pop();
         }
         unsafe { CFRelease(arr_ref) };
@@ -795,14 +834,14 @@ pub fn get_ui_tree(window_id: u32, max_depth: Option<i32>) -> napi::Result<serde
         )));
     };
 
-    let mut state = WalkState {
-        node_count: 0,
-        truncated_at_cap: false,
-    };
+    let mut state = WalkState::new();
     let mut node = build_node(ax_win, 0, max_depth, &mut state);
 
     if state.truncated_at_cap {
         node["truncated"] = serde_json::Value::Bool(true);
+    }
+    if state.timed_out {
+        node["timedOut"] = serde_json::Value::Bool(true);
     }
 
     unsafe {
@@ -873,6 +912,7 @@ pub fn find_element(
 
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut path: Vec<usize> = Vec::new();
+    let mut state = WalkState::new();
     find_visit(
         ax_win,
         role.as_deref(),
@@ -882,11 +922,20 @@ pub fn find_element(
         &mut path,
         &mut out,
         0,
+        &mut state,
     );
 
     unsafe {
         CFRelease(ax_win as *const _);
         CFRelease(ax_app as *const _);
+    }
+
+    // An empty list means "not there"; a walk that ran out of time has not looked everywhere, so it says so instead.
+    if out.is_empty() && state.timed_out {
+        return Err(napi::Error::from_reason(format!(
+            "ax_timeout: the app did not answer the accessibility walk within {} s",
+            WALK_BUDGET.as_secs()
+        )));
     }
 
     Ok(serde_json::Value::Array(out))
@@ -1153,7 +1202,7 @@ pub fn get_menu_bar(bundle_id: String) -> napi::Result<serde_json::Value> {
         )));
     };
 
-    let ax_app = unsafe { AXUIElementCreateApplication(pid) };
+    let ax_app = bounded(unsafe { AXUIElementCreateApplication(pid) });
     if ax_app.is_null() {
         return Err(napi::Error::from_reason(
             "AXUIElementCreateApplication failed",
@@ -1173,7 +1222,7 @@ pub fn get_menu_bar(bundle_id: String) -> napi::Result<serde_json::Value> {
         return Ok(serde_json::json!([]));
     }
 
-    let menu_bar = mb_val as AXUIElementRef;
+    let menu_bar = bounded(mb_val as AXUIElementRef);
     let mut out: Vec<serde_json::Value> = Vec::new();
 
     if let Some((arr_ref, kids)) = ax_copy_children(menu_bar) {
@@ -1228,7 +1277,7 @@ pub fn press_menu_item(
         return Ok(serde_json::json!({ "pressed": false, "reason": "app_not_running" }));
     };
 
-    let ax_app = unsafe { AXUIElementCreateApplication(pid) };
+    let ax_app = bounded(unsafe { AXUIElementCreateApplication(pid) });
     if ax_app.is_null() {
         return Ok(serde_json::json!({ "pressed": false, "reason": "ax_app_failed" }));
     }
@@ -1246,7 +1295,7 @@ pub fn press_menu_item(
         return Ok(serde_json::json!({ "pressed": false, "reason": "no_menu_bar" }));
     }
 
-    let menu_bar = mb_val as AXUIElementRef;
+    let menu_bar = bounded(mb_val as AXUIElementRef);
 
     // Find top-level menu.
     let target_menu_item = {

@@ -630,6 +630,32 @@ mod win {
         }
     }
 
+    // ── Minimised by this process (7.7.0, W4) ────────────────────────────
+    //
+    // prepare_display and hide_app record every window they minimise, so unhide_app (and the session's restore on
+    // close) brings back exactly those, never a window the person had minimised themselves (claude-code #91794).
+
+    static MINIMIZED_BY_US: std::sync::Mutex<Vec<(isize, String)>> = std::sync::Mutex::new(Vec::new());
+
+    fn minimized() -> std::sync::MutexGuard<'static, Vec<(isize, String)>> {
+        MINIMIZED_BY_US.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn same_app(name: &str, target: &str) -> bool {
+        let name = name.to_lowercase();
+        name == target || name.trim_end_matches(".exe") == target.trim_end_matches(".exe")
+    }
+
+    fn minimize_tracked(hwnd: HWND, name: &str) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        }
+        let mut list = minimized();
+        if !list.iter().any(|(h, _)| *h == hwnd.0 as isize) {
+            list.push((hwnd.0 as isize, name.to_string()));
+        }
+    }
+
     #[napi]
     pub fn prepare_display(
         target_bundle_id: String,
@@ -637,7 +663,7 @@ mod win {
     ) -> napi::Result<serde_json::Value> {
         let target = target_bundle_id.to_lowercase();
         let keep: Vec<String> = keep_visible.iter().map(|s| s.to_lowercase()).collect();
-        let mut hidden: Vec<String> = Vec::new();
+        let hidden: Vec<String>;
 
         unsafe {
             struct MinData {
@@ -654,23 +680,23 @@ mod win {
 
             unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 let data = &mut *(lparam.0 as *mut MinData);
-                if !IsWindowVisible(hwnd).as_bool() {
-                    return TRUE;
-                }
                 if IsIconic(hwnd).as_bool() {
                     return TRUE;
                 }
                 let mut pid: u32 = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid == std::process::id() {
+                    return TRUE;
+                }
                 if let Some(name) = super::win::process_name_for_pid(pid) {
-                    let lower = name.to_lowercase();
-                    if lower == data.target {
+                    // Only app windows: never cloaked, tool, owned or shell and input windows (TextInputHost, LockApp).
+                    if !crate::win_util::is_app_window(hwnd, &name) {
                         return TRUE;
                     }
-                    if data.keep.iter().any(|k| k == &lower) {
+                    if super::win::same_app(&name, &data.target) || data.keep.iter().any(|k| super::win::same_app(&name, k)) {
                         return TRUE;
                     }
-                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    super::win::minimize_tracked(hwnd, &name);
                     if !data.hidden.contains(&name) {
                         data.hidden.push(name);
                     }
@@ -688,7 +714,7 @@ mod win {
     #[napi]
     pub fn hide_app(bundle_id: String) -> napi::Result<bool> {
         let target = bundle_id.to_lowercase();
-        let mut found = false;
+        let found;
         unsafe {
             struct Data {
                 target: String,
@@ -702,17 +728,14 @@ mod win {
 
             unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 let data = &mut *(lparam.0 as *mut Data);
-                if !IsWindowVisible(hwnd).as_bool() {
+                if IsIconic(hwnd).as_bool() {
                     return TRUE;
                 }
                 let mut pid: u32 = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
                 if let Some(name) = super::win::process_name_for_pid(pid) {
-                    if name.to_lowercase() == data.target
-                        || name.to_lowercase().trim_end_matches(".exe")
-                            == data.target.trim_end_matches(".exe")
-                    {
-                        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    if super::win::same_app(&name, &data.target) && crate::win_util::is_app_window(hwnd, &name) {
+                        super::win::minimize_tracked(hwnd, &name);
                         data.found = true;
                     }
                 }
@@ -725,10 +748,31 @@ mod win {
         Ok(found)
     }
 
+    /// Restore an app's windows: exactly the ones this process minimised when there are any, otherwise (an explicit
+    /// request for an app the agent never hid) every minimised window of the app, as before. Never activates.
     #[napi]
     pub fn unhide_app(bundle_id: String) -> napi::Result<bool> {
         let target = bundle_id.to_lowercase();
-        let mut found = false;
+        let ours: Vec<isize> = {
+            let mut list = minimized();
+            let (mine, rest): (Vec<_>, Vec<_>) = list.drain(..).partition(|(_, name)| same_app(name, &target));
+            *list = rest;
+            mine.into_iter().map(|(hwnd, _)| hwnd).collect()
+        };
+        if !ours.is_empty() {
+            let mut restored = false;
+            for raw in ours {
+                let hwnd = HWND(raw as *mut _);
+                unsafe {
+                    if IsWindow(hwnd).as_bool() && IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        restored = true;
+                    }
+                }
+            }
+            return Ok(restored);
+        }
+        let found;
         unsafe {
             struct Data {
                 target: String,
@@ -745,14 +789,9 @@ mod win {
                 let mut pid: u32 = 0;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
                 if let Some(name) = super::win::process_name_for_pid(pid) {
-                    if name.to_lowercase() == data.target
-                        || name.to_lowercase().trim_end_matches(".exe")
-                            == data.target.trim_end_matches(".exe")
-                    {
-                        if IsIconic(hwnd).as_bool() {
-                            let _ = ShowWindow(hwnd, SW_RESTORE);
-                            data.found = true;
-                        }
+                    if super::win::same_app(&name, &data.target) && IsIconic(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        data.found = true;
                     }
                 }
                 TRUE
@@ -763,4 +802,23 @@ mod win {
         }
         Ok(found)
     }
+}
+
+/// 7.7.0 (K4): `activate_app` on a worker thread (Windows and Linux; see `activate_window_async`).
+#[cfg(not(target_os = "macos"))]
+#[napi_derive::napi]
+pub fn activate_app_async(
+    bundle_id: String,
+    timeout_ms: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            win::activate_app(bundle_id, timeout_ms)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::activate_app(bundle_id, timeout_ms)
+        }
+    })
 }

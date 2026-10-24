@@ -18,16 +18,21 @@ function runNpm(args) {
 function errorCode(result) {
   try { return JSON.parse(result.stdout).error?.code } catch { return undefined }
 }
+/** E409 for a version that is staged and awaiting approval, which staging again cannot replace. */
+function alreadyStaged(result) {
+  const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`
+  return errorCode(result) === 'E409' && /already staged|Cannot stage previously published version/i.test(text)
+}
 
 export function stagePlatformPackages(directory = root, npm = runNpm) {
-  const version = readJson(join(directory, 'package.json')).version
+  const rootPkg = readJson(join(directory, 'package.json'))
+  const version = rootPkg.version
   const packages = readJson(join(directory, 'release', 'platform', 'packages.json'))
   if (packages.length !== TARGETS.length || new Set(packages.map(pkg => pkg.target)).size !== TARGETS.length) {
     throw new Error('Release must contain all six distinct native packages')
   }
   // Complete local and registry preflight before staging any package.
-  const pending = []
-  for (const pkg of packages) {
+  const local = packages.map(pkg => {
     if (!TARGETS.includes(pkg.target) || pkg.version !== version ||
         pkg.name !== `@zavora-ai/computer-use-mcp-${pkg.target}` ||
         pkg.filename !== `zavora-ai-computer-use-mcp-${pkg.target}-${version}.tgz`) {
@@ -36,11 +41,29 @@ export function stagePlatformPackages(directory = root, npm = runNpm) {
     const archive = join(directory, 'release', 'platform', pkg.filename)
     const integrity = 'sha512-' + createHash('sha512').update(readFileSync(archive)).digest('base64')
     if (integrity !== pkg.integrity) throw new Error(`Tarball integrity mismatch: ${pkg.name}`)
+    return { pkg, archive, integrity }
+  })
+  // 7.6.2: a push after a release is not a release. The main version already on npm already chose its native
+  // dependencies, so nothing is staged; without this, every later push re-checked (and, with non-reproducible Windows
+  // builds, failed on) packages that cannot change, and a version from before the native packages existed tried to
+  // create them.
+  const mainSpec = `${rootPkg.name ?? '@zavora-ai/computer-use-mcp'}@${version}`
+  const main = npm(['view', mainSpec, 'version', '--json'])
+  if (main.status === 0 && main.stdout.trim()) {
+    console.log(`${mainSpec} is already published; no native packages to stage`)
+    return
+  }
+  if (main.status !== 0 && errorCode(main) !== 'E404') throw new Error(`Cannot check ${mainSpec}: ${main.stderr || main.stdout}`)
+  const pending = []
+  for (const { pkg, archive, integrity } of local) {
     const spec = `${pkg.name}@${version}`
     const existing = npm(['view', spec, 'dist.integrity', '--json'])
     if (existing.status === 0) {
-      if (JSON.parse(existing.stdout) !== integrity) throw new Error(`Published ${spec} differs from this build; bump the version`)
-      console.log(`${spec} already published with identical integrity — skipping`)
+      // 7.6.2: a published version is immutable, and Windows binaries differ from build to build, so a different
+      // tarball is not a reason to fail the release: nothing is staged for it, as the main package step does.
+      if (JSON.parse(existing.stdout) !== integrity) {
+        console.warn(`::warning::${spec} is already published and this build's tarball differs; nothing staged for it. Bump the version to publish again.`)
+      } else console.log(`${spec} already published with identical integrity — skipping`)
     } else {
       if (errorCode(existing) !== 'E404') throw new Error(`Cannot check ${spec}: ${existing.stderr || existing.stdout}`)
       pending.push({ spec, archive, integrity })
@@ -48,6 +71,12 @@ export function stagePlatformPackages(directory = root, npm = runNpm) {
   }
   for (const { spec, archive, integrity } of pending) {
     const result = npm(['stage', 'publish', archive, '--access', 'public', '--provenance', '--ignore-scripts', '--json'])
+    if (result.status !== 0 && alreadyStaged(result)) {
+      // A version staged and awaiting approval (E409) is not an error either: staging again cannot replace it, and the
+      // maintainer compares the pending tarball with this run's release evidence before approving (7.6.1 behaviour).
+      console.warn(`::warning::${spec} is already staged and awaiting approval; nothing staged again. Compare it with release evidence ${integrity} before approving.`)
+      continue
+    }
     if (result.status !== 0) {
       const git = process.env.GITHUB_SHA ? undefined : spawnSync('git', ['rev-parse', 'HEAD'], {
         cwd: directory, encoding: 'utf8', timeout: 5000,

@@ -171,6 +171,7 @@ test('C4: actions that did nothing are errors, not prose', async () => {
 
 test('A13: the instructions no longer promise an effect field that results do not carry', () => {
   const mac = buildInstructions('darwin', 'desktop')
-  assert.match(mac, /Only pid deliveries report a verification/)
+  // 7.7.0 (K1): every action now reports its effect; the instructions say how to read it.
+  assert.match(mac, /every action reply carries effect/)
   assert.ok(!/Results that say the effect is unverifiable/.test(mac))
 })

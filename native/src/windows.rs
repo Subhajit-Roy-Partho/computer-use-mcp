@@ -313,9 +313,11 @@ mod platform {
                 None
             };
 
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
+            // 7.7.0 (K6): the visible frame (DWM extended frame bounds), in the same physical pixels as input and
+            // captures, not GetWindowRect with its invisible resize borders.
+            let rect = crate::win_util::visible_bounds(hwnd);
             let display_id = monitor_for_rect(&rect);
+            let cloaked = crate::win_util::is_cloaked(hwnd);
 
             Some(serde_json::json!({
                 "windowId": hwnd.0 as usize,
@@ -329,15 +331,19 @@ mod platform {
                     "width": rect.right - rect.left,
                     "height": rect.bottom - rect.top,
                 },
-                "isOnScreen": !IsIconic(hwnd).as_bool(),
+                // A cloaked window (another virtual desktop, a suspended Store app) is not on screen.
+                "isOnScreen": !IsIconic(hwnd).as_bool() && !cloaked,
                 "isFocused": hwnd == fg_hwnd,
                 "displayId": display_id,
+                "minimized": IsIconic(hwnd).as_bool(),
+                "cloaked": cloaked,
             }))
         }
     }
 
     #[napi]
     pub fn list_windows(bundle_id: Option<String>) -> napi::Result<serde_json::Value> {
+        crate::dpi::ensure();
         let filter = bundle_id.map(|s| s.to_lowercase());
         let mut result: Vec<serde_json::Value> = Vec::new();
 
@@ -381,6 +387,7 @@ mod platform {
 
     #[napi]
     pub fn get_window(window_id: u32) -> napi::Result<serde_json::Value> {
+        crate::dpi::ensure();
         unsafe {
             let hwnd = HWND(window_id as *mut _);
             if !IsWindow(hwnd).as_bool() {
@@ -396,6 +403,7 @@ mod platform {
 
     #[napi]
     pub fn get_cursor_window() -> napi::Result<serde_json::Value> {
+        crate::dpi::ensure();
         unsafe {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -473,4 +481,16 @@ mod platform {
             }))
         }
     }
+}
+
+/// 7.7.0 (K4): `activate_window` on a worker thread. On Windows and Linux activation waits for the window to come to the
+/// front (up to the timeout); the JavaScript thread is not held while it does. macOS keeps the synchronous call: its
+/// activation goes through AppKit.
+#[cfg(not(target_os = "macos"))]
+#[napi_derive::napi]
+pub fn activate_window_async(
+    window_id: u32,
+    timeout_ms: Option<i32>,
+) -> napi::bindgen_prelude::AsyncTask<crate::async_task::JsonTask> {
+    crate::async_task::spawn(move || platform::activate_window(window_id, timeout_ms))
 }

@@ -182,6 +182,8 @@ export interface NativeModule {
     reason?: string
   }
   getEmergencyStopGeneration?(): number
+  /** 7.7.0 (K5): physical input since the monitor started (pointer travel, key presses, button presses). */
+  getPhysicalInputCounters?(): { supported: boolean; movement: number; keys: number; buttons: number }
   isNativeEmergencyStopActive?(): boolean
   triggerNativeEmergencyStop?(): void
   /** Host-only reset. This is intentionally never exposed as an MCP tool. */
@@ -223,6 +225,13 @@ export interface NativeModule {
   mouseClickToPid?(pid: number, x: number, y: number, button: string, count: number, windowId?: number): void
   mouseScrollToPid?(pid: number, x: number, y: number, dy: number, dx: number, windowId?: number): void
   holdKey(keys: string[], durationMs: number): void // throws on unknown key
+  /**
+   * 7.7.0: press keys and keep them down until `keyUp` (or the emergency latch) releases them. Every name is resolved
+   * before anything is pressed; an unknown key throws with nothing held. Optional: older native modules lack it.
+   */
+  keyDown?(keys: string[]): void
+  /** 7.7.0: release keys pressed by `keyDown`, in reverse order; `[]` releases everything held. Never refused by the latch. */
+  keyUp?(keys: string[]): void
   // Apps
   activateApp(bundleId: string, timeoutMs?: number): { bundleId: string; activated: boolean; displayName?: string }
   getFrontmostApp(): { bundleId: string; displayName: string; pid: number } | null
@@ -249,14 +258,44 @@ export interface NativeModule {
   getDisplaySize(displayId?: number): { x?: number; y?: number; width: number; height: number; pixelWidth: number; pixelHeight: number; scaleFactor: number; displayId: number }
   listDisplays(): Array<{ x?: number; y?: number; width: number; height: number; scaleFactor: number; displayId: number }>
   // Screenshot
-  takeScreenshot(width?: number, targetApp?: string, quality?: number, previousHash?: string, windowId?: number): {
+  takeScreenshot(width?: number, targetApp?: string, quality?: number, previousHash?: string, windowId?: number, displayId?: number): {
     base64?: string
     width: number
     height: number
     mimeType: string
     hash: string
     unchanged: boolean
+    /**
+     * 7.7.0 (Windows): how the image was captured (`print_window`, `graphics_capture`, `screen_crop`, `bitblt` for a
+     * window; `screen` for a display), whether a screen crop was partly covered, and the screen rectangle the image
+     * shows, in the same coordinates input uses.
+     */
+    capture?: { method: string; occluded: boolean; x: number; y: number; width: number; height: number }
   }
+
+  /**
+   * 7.7.0 (K4): the slow calls on a worker thread, resolving with what the synchronous call returns. The JavaScript
+   * thread (and the status card's Stop) is not held while a window is walked, captured or brought to the front. Optional:
+   * older native modules lack them, and activation stays synchronous on macOS. Callers go through `native-async.ts`.
+   */
+  takeScreenshotAsync?(...args: Parameters<NativeModule['takeScreenshot']>): Promise<ReturnType<NativeModule['takeScreenshot']>>
+  getUiTreeAsync?(...args: Parameters<NativeModule['getUiTree']>): Promise<ReturnType<NativeModule['getUiTree']>>
+  findElementAsync?(...args: Parameters<NativeModule['findElement']>): Promise<ReturnType<NativeModule['findElement']>>
+  getMenuBarAsync?(...args: Parameters<NativeModule['getMenuBar']>): Promise<ReturnType<NativeModule['getMenuBar']>>
+  activateWindowAsync?(...args: Parameters<NativeModule['activateWindow']>): Promise<ReturnType<NativeModule['activateWindow']>>
+  activateAppAsync?(...args: Parameters<NativeModule['activateApp']>): Promise<ReturnType<NativeModule['activateApp']>>
+
+  // ── 7.7.0 (K5): is the desktop usable, and keep it awake while an agent works ──
+  getSessionState?(): {
+    locked: boolean | null
+    disconnected: boolean
+    secureDesktop: boolean
+    offConsole: boolean
+    backend: string
+    detail?: string | null
+  }
+  holdDisplayAwake?(reason: string): boolean
+  releaseDisplayAwake?(): void
 
   // ── v5: Accessibility ──────────────────────────────────────────────────
   /** Depth-limited AX tree rooted at the window; caps at 500 nodes. */
@@ -344,6 +383,8 @@ export interface NativeModule {
   readClipboard?(): string
   /** Write text to clipboard (Windows native). Undefined on macOS. */
   writeClipboard?(text: string): void
+  /** 7.7.0 (K9): the clipboard holds an image, a PDF or files (every platform). */
+  clipboardHasNonText?(): boolean
   /** Draw annotations and grid lines on an image. Cross-platform. */
   annotateImage(base64Jpeg: string, annotations: string | null, gridCols: number | null, gridRows: number | null, quality: number | null): { base64: string; width: number; height: number; mimeType: string }
   /** Crop a region from a base64 image at full resolution. Cross-platform. */

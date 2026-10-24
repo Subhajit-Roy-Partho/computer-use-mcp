@@ -1,6 +1,6 @@
 import { z, type ZodTypeAny } from 'zod'
 import { errJson, okJson } from '../result.js'
-import { TOOL_CATALOG, getToolMeta, toToolMetaPublic, type ToolMeta } from '../tool-catalog.js'
+import { RUN_STEP_TOOLS, TOOL_CATALOG, getToolMeta, toToolMetaPublic, type ToolMeta } from '../tool-catalog.js'
 import type { ToolRegistry } from './registry.js'
 
 // v7.6 R7: one sentence per shared parameter; the guidance lives in the server instructions and get_tool_guide.
@@ -9,6 +9,8 @@ const targetWindowIdParam = z.number().int().optional().describe('Target window 
 const targetTitleParam = z.string().optional().describe('With target_app: the window whose title contains this text.')
 const forceParam = z.boolean().optional().describe('Override the user-active guard; only when the user asked for this action.')
 const deliveryParam = z.enum(['auto', 'hid', 'pid']).optional().describe('auto (default) | hid (frontmost app, moves the cursor) | pid (macOS: to the process, no focus or cursor change).')
+// 7.7.0 (K1): one sentence; the contract itself is in the server instructions.
+const verifyParam = z.boolean().optional().describe('Capture the target before and after; the reply\'s effect says changed or no_visible_change.')
 const focusStrategyParam = z.enum(['strict', 'best_effort', 'none', 'prepare_display']).optional().describe('strict | best_effort | none | prepare_display (hide other apps first).')
 export const approvalTokenParam = z.string().optional().describe('Policy approval token. Required only when COMPUTER_USE_APPROVAL_TOKEN / approval policy requires it.')
 // NOTE: use length-constrained z.array (not z.tuple). Zod tuples serialize to
@@ -30,10 +32,11 @@ const withDelivery = (schema: Record<string, ZodTypeAny>) => ({
   ...withTargeting(schema),
   target_title: targetTitleParam,
   delivery: deliveryParam,
+  verify: verifyParam,
 })
 
 /** 7.6.1: the click aliases accept click's targeting without advertising it (their schemas stay a line each). */
-export const ALIAS_TARGETING_ARGS = ['target_app', 'target_window_id', 'target_title', 'focus_strategy', 'force', 'delivery'] as const
+export const ALIAS_TARGETING_ARGS = ['target_app', 'target_window_id', 'target_title', 'focus_strategy', 'force', 'delivery', 'verify'] as const
 
 const PROVIDERS = ['anthropic', 'openai', 'openai-low', 'gemini', 'llama', 'grok', 'mistral', 'qwen', 'nova', 'deepseek-vl', 'deepseek-flash', 'phi', 'auto'] as const
 
@@ -90,6 +93,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     target_window_id: targetWindowIdParam,
     focus_strategy: focusStrategyParam,
     return_screenshot: z.boolean().optional().describe('Capture a screenshot after the batch'),
+    coordinate_space: z.enum(['screenshot', 'screen']).optional().describe('screenshot (default): x/y are pixels of the last screenshot, mapped to the screen. screen: x/y are screen coordinates.'),
     use_virtual_pointer: z.boolean().optional().describe('For move actions, update the virtual agent pointer instead of moving the real OS cursor'),
     native_overlay: z.boolean().optional().describe('When use_virtual_pointer=true, show/update the native overlay pointer if available.'),
     provider: z.enum(PROVIDERS).optional().describe('Screenshot provider defaults when the adapter captures screenshots'),
@@ -103,6 +107,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     quality: z.number().int().min(0).max(100).optional()
       .describe('Image quality. 1-100 = JPEG quality. 0 = PNG (lossless). Default: 80 (JPEG).'),
     full_screen: z.boolean().optional().describe('Capture the whole screen even when a session target is set.'),
+    display_id: z.number().int().optional().describe('With full_screen: which display (list_displays); default the main one.'),
     target_app: z.string().optional()
       .describe('Bundle ID of app to capture: its main window (largest titled window).'),
     target_window_id: targetWindowIdParam,
@@ -111,6 +116,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
       .describe('AI provider — sets optimal default width. anthropic=1024px, openai=1024px, gemini=768px, deepseek-flash=1280px, qwen/deepseek-vl/phi=896px. Default: auto (1024px).'),
     show_agent_pointer: z.boolean().optional()
       .describe('Render the virtual agent pointer into the returned screenshot without moving the OS cursor.'),
+    resend: z.boolean().optional().describe('Send the image even when nothing changed since the last capture.'),
   }, NONE_READ)
   tool('zoom', 'View a specific region of the screen at full resolution. Useful for reading small text, inspecting UI details, or verifying pixel-level content. Returns the cropped region without downscaling. With target_app or target_window_id the region is in that window\'s points, from its top-left. To read text, read_window_text is cheaper than an image.', {
     region: intArray(4)
@@ -130,6 +136,16 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
   // v7.6 R7: the v7 click variants stay callable as thin aliases of click (the registry parses with passthrough, so
   // target_app, target_window_id, delivery and force still work on them); they cost a line each in the list.
   const alias = { undeclaredArgs: ALIAS_TARGETING_ARGS }
+  tool('run_steps', 'Several actions in one call, in order. Every step is checked before any runs, the target is focused once, and the batch stops at the first failing step (the rest are reported not run). For a known sequence: click a field, type, press return. Look between steps you are unsure of.', {
+    steps: z.array(z.object({
+      tool: z.enum(RUN_STEP_TOOLS),
+      args: z.record(z.string(), z.unknown()).optional().describe('The tool\'s own arguments.'),
+    })).min(1).max(30).describe('{tool, args} each. A step with no target uses the batch target.'),
+    target_app: targetAppParam,
+    target_window_id: targetWindowIdParam,
+    capture: z.enum(['none', 'window', 'screen']).optional().describe('One capture after the last step (default none).'),
+    region: intArray(4).optional().describe('With capture window: [x1, y1, x2, y2] in window points.'),
+  }, CG_MUT)
   tool('left_click', 'Alias of click (button left, count 1). Prefer click.', coord, CG_MUT, alias)
   tool('right_click', 'Alias of click (button right). Prefer click.', coord, CG_MUT, alias)
   tool('middle_click', 'Alias of click (button middle). Prefer click.', coord, CG_MUT, alias)
@@ -165,6 +181,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     force: forceParam,
     target_title: targetTitleParam,
     delivery: deliveryParam,
+    verify: verifyParam,
   }, CG_MUT, { undeclaredArgs: ['delta_x', 'delta_y'] })
   tool('type', 'Type text into the focused app. For form fields, prefer set_value or fill_form — accessibility-based writes are more reliable and need no click-to-focus. mode "keys" sends real key events, for apps that bind keys (a game console on the grave/tilde key).', {
     text: z.string(),
@@ -178,6 +195,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     force: forceParam,
     target_title: targetTitleParam,
     delivery: deliveryParam,
+    verify: verifyParam,
   }, CG_MUT)
   tool('key', 'Press a key combination (e.g. "command+c", "return"). Tab and Shift+Tab navigate between form fields; keyboard shortcuts are usually faster than coordinate-based clicks.', {
     text: z.string().describe('Key combo like "command+c", "return", "grave" (`), "tilde" or "shift+minus". Unknown names are refused with the list of valid ones'),
@@ -188,10 +206,11 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     force: forceParam,
     target_title: targetTitleParam,
     delivery: deliveryParam,
+    verify: verifyParam,
   }, CG_MUT)
   tool('hold_key', 'Hold keys for a duration', {
     keys: z.array(z.string()),
-    duration: z.number().positive().max(10).describe('Seconds (max 10: the hold runs on the server thread, so a long hold blocks every other tool)'),
+    duration: z.number().positive().max(10).describe('Seconds (max 10). Pause, Stop and cancellation release the keys at once.'),
     target_app: targetAppParam,
     target_window_id: targetWindowIdParam,
     focus_strategy: focusStrategyParam,

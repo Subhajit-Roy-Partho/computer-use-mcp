@@ -19,7 +19,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,7 +27,8 @@ import type { NativeModule } from '../native.js'
 import { compileSwiftHelper, defaultHelperCacheDir } from './macos-helper.js'
 
 export type ControlState = 'running' | 'paused' | 'stopped'
-export type ControlReason = 'person' | 'host' | 'emergency_stop' | 'session_closed'
+/** `takeover` (7.7.0, K5): the person used the mouse or keyboard while the agent was acting; it resumes when they stop. */
+export type ControlReason = 'person' | 'host' | 'emergency_stop' | 'session_closed' | 'takeover'
 export type ControlWaiting = 'user_active' | 'approval' | null
 
 export interface ControlAction {
@@ -80,6 +81,24 @@ export interface CardPresenter {
 export const CONTROL_POLL_MS = 150
 const RECENT_ACTIONS = 4
 
+/**
+ * 7.7.0 (K5): what counts as the person taking over during an action: any physical key or button press, or this much
+ * pointer travel (points, summed |dx| + |dy|; Windows-MCP settled on 500 after nudges kept pausing agents). After a
+ * takeover the agent resumes once the person has been idle this long.
+ */
+export const TAKEOVER_MOVEMENT = 500
+export const TAKEOVER_RESUME_IDLE_MS = 5000
+const TAKEOVER_POLL_MS = 100
+
+export interface TakeoverOptions {
+  counters: () => { supported: boolean; movement: number; keys: number; buttons: number } | undefined
+  /** Milliseconds since the person's last physical input, or null when unknown. */
+  idleMs: () => number | null | undefined
+  movement?: number
+  resumeIdleMs?: number
+  pollMs?: number
+}
+
 function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
   if (!a) return b
   if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b])
@@ -115,6 +134,11 @@ export class OperatorControl {
   #waiting: ControlWaiting = null
   #lastRefused: { tool: string; at: string } | null = null
   #lastFrame = ''
+  readonly #takeover: TakeoverOptions | undefined
+  #takeoverTimer: ReturnType<typeof setInterval> | undefined
+  #takeoverBaseline: { movement: number; keys: number; buttons: number } | undefined
+  #resumeTimer: ReturnType<typeof setInterval> | undefined
+  #watcher: { close(): void } | undefined
 
   constructor(options: {
     native?: Partial<Pick<NativeModule, 'triggerNativeEmergencyStop' | 'isNativeEmergencyStopActive'>>
@@ -124,6 +148,8 @@ export class OperatorControl {
     platform?: NodeJS.Platform
     /** The physical emergency-stop chord, when a host armed one; shown on the card. */
     chord?: string | null
+    /** 7.7.0 (K5): pause when the person takes over the mouse or keyboard during an action; absent: no takeover. */
+    takeover?: TakeoverOptions
   } = {}) {
     this.#native = options.native ?? {}
     this.#now = options.now ?? Date.now
@@ -131,6 +157,7 @@ export class OperatorControl {
     this.#pollMs = options.card?.pollMs ?? CONTROL_POLL_MS
     this.#platform = options.platform ?? process.platform
     this.#chord = options.chord ?? null
+    this.#takeover = options.takeover
     this.#startedAt = this.#now()
     this.#since = this.#startedAt
     if (options.card) {
@@ -158,6 +185,12 @@ export class OperatorControl {
       emergencyStop: { latched: this.#native.isNativeEmergencyStopActive?.() === true },
       lastRefused: this.#lastRefused,
       waiting: this.#waiting,
+      takeover: this.#takeover ? {
+        enabled: true,
+        movement: this.#takeover.movement ?? TAKEOVER_MOVEMENT,
+        resumeIdleMs: this.#takeover.resumeIdleMs ?? TAKEOVER_RESUME_IDLE_MS,
+      } : { enabled: false },
+      chord: this.#chord,
     }
   }
 
@@ -174,6 +207,16 @@ export class OperatorControl {
     const at = new Date(this.#now()).toISOString()
     this.#lastRefused = { tool, at }
     this.#publish()
+    if (this.#state === 'paused' && this.#reason === 'takeover') {
+      return {
+        error: 'taken_over',
+        status: this.#state,
+        tool,
+        since: new Date(this.#since).toISOString(),
+        reason: this.#reason,
+        hint: `The person is using the mouse or keyboard, so the agent paused. It resumes by itself ${Math.round((this.#takeover?.resumeIdleMs ?? TAKEOVER_RESUME_IDLE_MS) / 1000)} s after they stop; then look before acting.`,
+      }
+    }
     return {
       error: `${this.#state}_by_user`,
       status: this.#state,
@@ -186,22 +229,76 @@ export class OperatorControl {
     }
   }
 
-  /** A tracked call started; launches the card on the first one. */
-  begin(action: { tool: string; label: string; app?: string; window?: string }): void {
+  /**
+   * A tracked call started. 7.7.0: the card launches on the first call that changes the desktop (`mutates`), not on
+   * a screenshot; a mutating call also arms the takeover watch for its duration.
+   */
+  begin(action: { tool: string; label: string; app?: string; window?: string }, options: { mutates?: boolean } = {}): void {
     if (this.#closed) return
-    this.#ensurePresenter()
+    if (options.mutates !== false) this.#ensurePresenter()
     this.#refresh()
     this.#action = { ...action, at: new Date(this.#now()).toISOString(), outcome: 'active' }
     this.#waiting = null
+    if (options.mutates) this.#watchTakeover()
     this.#publish()
   }
 
   finish(outcome: 'done' | 'failed'): void {
+    this.#stopTakeoverWatch()
     if (this.#closed || !this.#action) return
     const finished: ControlAction = { ...this.#action, outcome }
     this.#recent = [finished, ...this.#recent].slice(0, RECENT_ACTIONS)
     this.#action = null
     this.#publish()
+  }
+
+  // ── Takeover (7.7.0, K5) ───────────────────────────────────────────────
+
+  #watchTakeover(): void {
+    if (!this.#takeover || this.#takeoverTimer || this.#state !== 'running') return
+    const first = this.#takeover.counters()
+    if (!first?.supported) return
+    this.#takeoverBaseline = { movement: first.movement, keys: first.keys, buttons: first.buttons }
+    this.#takeoverTimer = setInterval(() => this.#checkTakeover(), this.#takeover.pollMs ?? TAKEOVER_POLL_MS)
+    this.#takeoverTimer.unref?.()
+  }
+
+  #stopTakeoverWatch(): void {
+    if (this.#takeoverTimer) clearInterval(this.#takeoverTimer)
+    this.#takeoverTimer = undefined
+    this.#takeoverBaseline = undefined
+  }
+
+  #checkTakeover(): void {
+    const baseline = this.#takeoverBaseline
+    const now = this.#takeover?.counters()
+    if (!baseline || !now?.supported || this.#state !== 'running') return
+    const deliberate = now.keys > baseline.keys || now.buttons > baseline.buttons
+      || now.movement - baseline.movement >= (this.#takeover?.movement ?? TAKEOVER_MOVEMENT)
+    if (!deliberate) return
+    this.#stopTakeoverWatch()
+    this.#transition('paused', 'takeover')
+    this.#watchResume()
+  }
+
+  /** Resume after a takeover once the person has been idle long enough; a person's own pause or stop wins. */
+  #watchResume(): void {
+    if (!this.#takeover || this.#resumeTimer) return
+    const quiet = this.#takeover.resumeIdleMs ?? TAKEOVER_RESUME_IDLE_MS
+    this.#resumeTimer = setInterval(() => {
+      if (this.#closed || this.#state !== 'paused' || this.#reason !== 'takeover') {
+        clearInterval(this.#resumeTimer)
+        this.#resumeTimer = undefined
+        return
+      }
+      const idle = this.#takeover?.idleMs()
+      if (typeof idle === 'number' && idle >= quiet) {
+        clearInterval(this.#resumeTimer)
+        this.#resumeTimer = undefined
+        this.#transition('running', 'takeover')
+      }
+    }, 250)
+    this.#resumeTimer.unref?.()
   }
 
   /** What the agent is waiting on, so the card can say "waiting for you" or "approval needed". */
@@ -232,6 +329,9 @@ export class OperatorControl {
     if (this.#closed) return
     this.#closed = true
     if (this.#timer) clearInterval(this.#timer)
+    this.#stopTakeoverWatch()
+    if (this.#resumeTimer) clearInterval(this.#resumeTimer)
+    try { this.#watcher?.close() } catch { /* already closed */ }
     if (!this.#controller.signal.aborted) this.#controller.abort(new Error('Desktop session closed'))
     this.#writeControl('stopped')
     try { this.#presenter?.stop() } catch { /* already gone */ }
@@ -263,6 +363,22 @@ export class OperatorControl {
       this.#timer = setInterval(() => this.#refresh(), this.#pollMs)
       this.#timer.unref?.()
     }
+    this.#watchControlFile()
+  }
+
+  /**
+   * 7.7.0 (K4): react to the card's Pause and Stop the moment `control.txt` changes, not at the next 150 ms poll (the
+   * poll stays as a fallback for file systems where watching is unreliable).
+   */
+  #watchControlFile(): void {
+    if (this.#watcher || !this.#directory) return
+    try {
+      const watcher = watch(this.#directory, { persistent: false }, (_event, file) => {
+        if (!file || String(file) === 'control.txt') this.#refresh()
+      })
+      watcher.on('error', () => { /* the poll remains */ })
+      this.#watcher = watcher
+    } catch { /* the poll remains */ }
   }
 
   /** Apply what the card wrote, if it changed. */
@@ -387,8 +503,30 @@ export function defaultCardPresenter(platform: NodeJS.Platform = process.platfor
   return undefined
 }
 
-/** `COMPUTER_USE_STATUS_CARD=true` (opt-in in 7.6.1). */
-export function statusCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+/**
+ * Whether the desktop status card shows. 7.7.0 (K5): on by default on macOS, where it has run since 7.6.1;
+ * `COMPUTER_USE_STATUS_CARD=false` turns it off. Windows stays opt-in (`true`) until the card has been run on more
+ * hardware; Linux has no card yet.
+ */
+export function statusCardEnabled(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
   const raw = env.COMPUTER_USE_STATUS_CARD?.trim().toLowerCase()
-  return raw === 'true' || raw === '1'
+  if (raw === 'true' || raw === '1') return true
+  if (raw === 'false' || raw === '0') return false
+  return platform === 'darwin'
+}
+
+/** The emergency-stop chord armed by default (7.7.0, K5): two modifiers and Escape, shown on the card. */
+export const DEFAULT_EMERGENCY_CHORD = 'ctrl+alt+escape'
+
+/** The chord to arm: `COMPUTER_USE_EMERGENCY_CHORD` (`off` disables), else the default on macOS and Windows. */
+export function emergencyChord(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string | null {
+  const raw = env.COMPUTER_USE_EMERGENCY_CHORD?.trim()
+  if (raw && /^(off|false|0|none)$/i.test(raw)) return null
+  if (raw) return raw
+  return platform === 'darwin' || platform === 'win32' ? DEFAULT_EMERGENCY_CHORD : null
+}
+
+/** `COMPUTER_USE_TAKEOVER=false` turns the takeover watch off (7.7.0: on by default). */
+export function takeoverEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !/^(false|0|off)$/i.test(env.COMPUTER_USE_TAKEOVER?.trim() ?? '')
 }

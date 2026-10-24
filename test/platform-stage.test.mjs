@@ -26,6 +26,8 @@ function fixture(t) {
   return { directory, destination, packages }
 }
 const error = (code, summary = code) => ({ status: 1, stdout: JSON.stringify({ error: { code, summary } }), stderr: '' })
+// The main package's own version check (7.6.2) comes first; these fixtures stage an unreleased version.
+const isMainView = args => args[0] === 'view' && args[1].startsWith('@zavora-ai/computer-use-mcp@')
 
 test('all six native packages are preflighted and staged with provenance from exact tarballs', t => {
   const { directory, packages } = fixture(t)
@@ -34,9 +36,10 @@ test('all six native packages are preflighted and staged with provenance from ex
     calls.push(args)
     return args[0] === 'view' ? error('E404') : { status: 0, stdout: '{}', stderr: '' }
   })
-  assert.equal(calls.length, 12)
-  assert.ok(calls.slice(0, 6).every(args => args[0] === 'view'))
-  for (const [index, args] of calls.slice(6).entries()) {
+  assert.equal(calls.length, 13)
+  assert.ok(isMainView(calls[0]), 'the main version is checked first')
+  assert.ok(calls.slice(1, 7).every(args => args[0] === 'view'))
+  for (const [index, args] of calls.slice(7).entries()) {
     assert.equal(args[0], 'stage')
     assert.equal(args[1], 'publish')
     assert.equal(args[2], path.join(directory, 'release', 'platform', packages[index].filename))
@@ -50,22 +53,51 @@ test('published native versions skip only when the packed integrity matches', t 
   let index = 0
   stagePlatformPackages(directory, args => {
     assert.equal(args[0], 'view')
+    if (isMainView(args)) return error('E404')
     return { status: 0, stdout: JSON.stringify(packages[index++].integrity), stderr: '' }
   })
   assert.equal(index, 6)
 })
 
-test('a conflicting published binary or registry authentication failure prevents any staging', t => {
+test('a published native that differs from this build is skipped with a warning; the others still stage', t => {
   const { directory, packages } = fixture(t)
-  for (const fail of [() => ({ status: 0, stdout: JSON.stringify('wrong-integrity'), stderr: '' }), () => error('E401')]) {
-    let index = 0
-    assert.throws(() => stagePlatformPackages(directory, args => {
-      assert.equal(args[0], 'view', 'no writes before the complete preflight succeeds')
-      if (index++ === 2) return fail()
-      return error('E404')
-    }), /differs from this build|Cannot check/)
-  }
-  assert.equal(packages.length, 6)
+  let index = 0
+  const staged = []
+  stagePlatformPackages(directory, args => {
+    if (isMainView(args)) return error('E404')
+    if (args[0] === 'view') return index++ === 2 ? { status: 0, stdout: JSON.stringify('sha512-different'), stderr: '' } : error('E404')
+    staged.push(args[2])
+    return { status: 0, stdout: '{}', stderr: '' }
+  })
+  assert.deepEqual(staged, packages.filter((_, i) => i !== 2).map(pkg => path.join(directory, 'release', 'platform', pkg.filename)))
+})
+
+test('a registry authentication failure on a native check prevents any staging', t => {
+  const { directory } = fixture(t)
+  let index = 0
+  assert.throws(() => stagePlatformPackages(directory, args => {
+    assert.equal(args[0], 'view', 'no writes before the complete preflight succeeds')
+    if (isMainView(args)) return error('E404')
+    return index++ === 2 ? error('E401') : error('E404')
+  }), /Cannot check/)
+})
+
+test('nothing is staged or checked when the main version is already published', t => {
+  const { directory } = fixture(t)
+  const calls = []
+  stagePlatformPackages(directory, args => {
+    calls.push(args)
+    return isMainView(args) ? { status: 0, stdout: JSON.stringify('9.0.0-test.1'), stderr: '' } : error('E500')
+  })
+  assert.deepEqual(calls, [['view', '@zavora-ai/computer-use-mcp@9.0.0-test.1', 'version', '--json']])
+})
+
+test('a registry failure on the main version check stops staging', t => {
+  const { directory } = fixture(t)
+  assert.throws(() => stagePlatformPackages(directory, args => {
+    assert.ok(isMainView(args), 'no native package is checked or staged')
+    return error('E401')
+  }), /Cannot check @zavora-ai\/computer-use-mcp@9\.0\.0-test\.1/)
 })
 
 test('local corruption, duplicate targets and version skew prevent staging', t => {
@@ -79,35 +111,46 @@ test('local corruption, duplicate targets and version skew prevent staging', t =
   assert.throws(() => stagePlatformPackages(directory), /Invalid native release metadata/)
 })
 
-test('every staging conflict fails closed and stops the remaining native publishes', t => {
+test('a version already staged and awaiting approval is tolerated; the remaining natives still stage', t => {
   const { directory, packages } = fixture(t)
-  for (const summary of ['Cannot stage previously published version', 'already staged', 'other conflict']) {
-    for (const conflictAt of [0, 2]) {
-      const staged = []
-      assert.throws(() => stagePlatformPackages(directory, args => {
-        if (args[0] === 'view') return error('E404')
-        staged.push(args[2])
-        return staged.length === conflictAt + 1 ? error('E409', summary) : { status: 0, stdout: '{}', stderr: '' }
-      }), thrown => {
-        assert.match(thrown.message, /Cannot stage .*E409/)
-        assert.ok(thrown.message.includes(`${packages[conflictAt].name}@${packages[conflictAt].version}`))
-        assert.ok(thrown.message.includes(packages[conflictAt].filename))
-        assert.ok(thrown.message.includes(packages[conflictAt].integrity))
-        assert.match(thrown.message, /Commit: .*\nArtifact: .*\nIntegrity: /)
-        return true
-      })
-      assert.deepEqual(staged, packages.slice(0, conflictAt + 1).map(pkg => path.join(directory, 'release', 'platform', pkg.filename)))
-    }
+  for (const summary of ['Cannot stage previously published version', 'already staged']) {
+    const staged = []
+    stagePlatformPackages(directory, args => {
+      if (args[0] === 'view') return error('E404')
+      staged.push(args[2])
+      return staged.length === 1 ? error('E409', summary) : { status: 0, stdout: '{}', stderr: '' }
+    })
+    assert.deepEqual(staged, packages.map(pkg => path.join(directory, 'release', 'platform', pkg.filename)))
   }
 })
 
-test('an unverified staging conflict exits nonzero with the commit and artifact context', t => {
+test('any other staging conflict stops the remaining native publishes with the release evidence', t => {
+  const { directory, packages } = fixture(t)
+  for (const conflictAt of [0, 2]) {
+    const staged = []
+    assert.throws(() => stagePlatformPackages(directory, args => {
+      if (args[0] === 'view') return error('E404')
+      staged.push(args[2])
+      return staged.length === conflictAt + 1 ? error('E409', 'other conflict') : { status: 0, stdout: '{}', stderr: '' }
+    }), thrown => {
+      assert.match(thrown.message, /Cannot stage .*E409/)
+      assert.ok(thrown.message.includes(`${packages[conflictAt].name}@${packages[conflictAt].version}`))
+      assert.ok(thrown.message.includes(packages[conflictAt].filename))
+      assert.ok(thrown.message.includes(packages[conflictAt].integrity))
+      assert.match(thrown.message, /Commit: .*\nArtifact: .*\nIntegrity: /)
+      return true
+    })
+    assert.deepEqual(staged, packages.slice(0, conflictAt + 1).map(pkg => path.join(directory, 'release', 'platform', pkg.filename)))
+  }
+})
+
+test('a staging failure exits nonzero with the commit and artifact context', t => {
   const { directory, packages } = fixture(t)
   const commit = 'a'.repeat(40)
   const script = `
     import { stagePlatformPackages } from ${JSON.stringify(new URL('../scripts/stage-platform-packages.mjs', import.meta.url).href)};
     stagePlatformPackages(${JSON.stringify(directory)}, args => ({
-      status: 1, stderr: '', stdout: JSON.stringify({error: {code: args[0] === 'view' ? 'E404' : 'E409', summary: 'already staged'}}),
+      status: 1, stderr: '', stdout: JSON.stringify({error: {code: args[0] === 'view' ? 'E404' : 'E409', summary: 'other conflict'}}),
     }));
   `
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {

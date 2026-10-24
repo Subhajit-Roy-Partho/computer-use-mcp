@@ -110,7 +110,7 @@ test('list_windows reports kinds and consults AX only for a single app', async (
   assert.deepEqual(axCalls, [77])
 })
 
-test('screenshot target_app captures the main window and target_title another', () => {
+test('screenshot target_app captures the main window and target_title another', async () => {
   const calls = []
   const native = {
     listWindows: () => unreal,
@@ -123,12 +123,12 @@ test('screenshot target_app captures the main window and target_title another', 
     native, targets: new TargetStateController(native), pointer: new VirtualPointerController(native),
     visionEnabled: true, defaultProvider: 'auto', env: {},
   })
-  handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor' })
+  await handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor' })
   assert.equal(calls[0][1], undefined, 'native is given the chosen window, not the bundle')
   assert.equal(calls[0][4], 1861)
-  handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor', target_title: 'Message' })
+  await handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor', target_title: 'Message' })
   assert.equal(calls[1][4], 1900)
-  const miss = handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor', target_title: 'zzz' })
+  const miss = await handler.handle('screenshot', { target_app: 'com.epicgames.UnrealEditor', target_title: 'zzz' })
   assert.equal(miss.isError, true)
   assert.equal(miss.structuredContent.error, 'window_not_found')
 })

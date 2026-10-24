@@ -1,6 +1,8 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
 import type { NativeModule } from '../native.js'
+import { offThread } from './native-async.js'
 import type { SpawnBounded, SpawnResult } from './spawn.js'
+import { utf8Env } from './input-handlers.js'
 import type { LegacyPolicyConfig } from './legacy-policy.js'
 
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip'
@@ -92,7 +94,7 @@ export async function runDoctor(options: {
   // missing — so the permission itself is the fact, not the image payload.
   const captureTrust = isMacos ? nativePermission(options.native, 'display_capture') : undefined
   try {
-    const shot = options.native.takeScreenshot(320, undefined, 80, undefined, undefined)
+    const shot = await offThread(options.native, 'takeScreenshot', 320, undefined, 80, undefined, undefined)
     const captureDenied = captureTrust?.granted === false
     add({
       id: 'display_capture', status: captureDenied || !shot.base64 ? 'fail' : 'pass',
@@ -121,7 +123,7 @@ export async function runDoctor(options: {
     try {
       saved = isWindows && options.native.readClipboard
         ? options.native.readClipboard()
-        : executeFile('pbpaste', []).toString()
+        : executeFile('pbpaste', [], { env: utf8Env() }).toString()
     } catch { /* clipboard may be empty */ }
     let roundTrip: string
     if (isWindows && options.native.writeClipboard && options.native.readClipboard) {
@@ -129,9 +131,9 @@ export async function runDoctor(options: {
       roundTrip = options.native.readClipboard()
       if (saved) options.native.writeClipboard(saved)
     } else {
-      executeFile('pbcopy', [], { input: marker })
-      roundTrip = executeFile('pbpaste', []).toString()
-      executeFile('pbcopy', [], { input: saved })
+      executeFile('pbcopy', [], { input: marker, env: utf8Env() })
+      roundTrip = executeFile('pbpaste', [], { env: utf8Env() }).toString()
+      executeFile('pbcopy', [], { input: saved, env: utf8Env() })
     }
     add({
       id: 'clipboard', status: roundTrip === marker ? 'pass' : 'fail',

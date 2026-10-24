@@ -1,5 +1,43 @@
-// ── macOS: clipboard handled in session layer via pbcopy/pbpaste ─────────────
-// No native clipboard functions needed on macOS.
+// ── macOS: text goes through pbcopy/pbpaste in the session layer ─────────────
+//
+// 7.7.0 (K9): one native question on every platform, `clipboard_has_non_text`. Pasting long text saves the
+// clipboard's text and restores it afterwards; when the clipboard held an image or a list of files, there was no text
+// to save, and the restore left the person with empty text instead of what they had copied. The session asks first
+// and types the text instead of pasting it when the clipboard holds something else.
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use napi_derive::napi;
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    /// Pasteboard types that are not text: images, PDFs and files.
+    fn is_non_text(kind: &str) -> bool {
+        kind.starts_with("public.image") || kind == "public.tiff" || kind == "public.png" || kind == "public.jpeg"
+            || kind == "public.heic" || kind == "com.adobe.pdf" || kind == "public.file-url"
+            || kind == "NSFilenamesPboardType" || kind.starts_with("com.apple.pasteboard.promised")
+    }
+
+    #[napi]
+    pub fn clipboard_has_non_text() -> bool {
+        objc::rc::autoreleasepool(|| unsafe {
+            let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+            if pasteboard.is_null() {
+                return false;
+            }
+            let types: *mut Object = msg_send![pasteboard, types];
+            if types.is_null() {
+                return false;
+            }
+            let count: usize = msg_send![types, count];
+            (0..count).any(|index| {
+                let kind: *mut Object = msg_send![types, objectAtIndex: index];
+                let utf8: *const std::os::raw::c_char = msg_send![kind, UTF8String];
+                !utf8.is_null() && is_non_text(&std::ffi::CStr::from_ptr(utf8).to_string_lossy())
+            })
+        })
+    }
+}
 
 // ── Linux implementation ─────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
@@ -47,28 +85,54 @@ mod linux {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// The clipboard holds an image or files (7.7.0, K9). Unknown (no tool) reads as text only.
+    #[napi]
+    pub fn clipboard_has_non_text() -> bool {
+        let listed = if is_wayland() {
+            crate::linux_tools::output("wl-paste", &["--list-types"])
+        } else {
+            crate::linux_tools::output("xclip", &["-selection", "clipboard", "-o", "-t", "TARGETS"])
+        };
+        match listed {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).lines().any(|kind| {
+                let kind = kind.trim();
+                kind.starts_with("image/") || kind == "text/uri-list" || kind == "x-special/gnome-copied-files"
+                    || kind == "application/pdf"
+            }),
+            _ => false,
+        }
+    }
+
     #[napi]
     pub fn write_clipboard(text: String) -> napi::Result<()> {
         if is_wayland() {
-            // wl-copy works best with text as argument
+            // wl-copy works best with text as argument. 7.7.0 (L1): it forks a server that keeps the selection, so it
+            // must never hold this process's stdout (the MCP channel).
             let status = Command::new("wl-copy")
                 .arg(&text)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
-                .map_err(|e| napi::Error::from_reason(format!("wl-copy failed: {e}")))?;
+                .map_err(|e| napi::Error::from_reason(format!("wl-copy failed (install wl-clipboard): {e}")))?;
             if status.success() {
                 return Ok(());
             }
         }
-        // X11 fallback: pipe to xclip
+        // X11 fallback: pipe to xclip, which stays running to serve the selection; never with our stdout (L1).
         use std::io::Write;
         let child = Command::new("xclip")
             .args(["-selection", "clipboard"])
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .or_else(|_| {
                 Command::new("xsel")
                     .args(["--clipboard", "--input"])
                     .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .spawn()
             });
         let mut child = child.map_err(|e| {
@@ -96,6 +160,17 @@ mod win {
     use windows::Win32::System::DataExchange::*;
     use windows::Win32::System::Memory::*;
     use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    /// The clipboard holds an image, a file list or a metafile (7.7.0, K9).
+    #[napi]
+    pub fn clipboard_has_non_text() -> bool {
+        // CF_BITMAP 2, CF_TIFF 6, CF_DIB 8, CF_ENHMETAFILE 14, CF_HDROP 15, CF_DIBV5 17, and the registered "PNG".
+        let png = unsafe { RegisterClipboardFormatW(windows::core::w!("PNG")) };
+        [2u32, 6, 8, 14, 15, 17, png]
+            .into_iter()
+            .filter(|format| *format != 0)
+            .any(|format| unsafe { IsClipboardFormatAvailable(format).is_ok() })
+    }
 
     const MAX_RETRIES: u32 = 3;
     const RETRY_DELAY_MS: u64 = 50;
