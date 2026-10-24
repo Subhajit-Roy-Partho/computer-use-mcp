@@ -210,6 +210,12 @@ final class Card {
     }
 
     @objc func stop() {
+        // 7.7.0: once the agent is stopped the button reads Close and dismisses the card. The server keeps the stopped
+        // state (and does not open the card again), so closing it resumes nothing.
+        if readControl() == "stopped" {
+            NSApp.terminate(nil)
+            return
+        }
         control = "stopped"
         writeControl(control)
         render(frame: lastFrame)
@@ -235,7 +241,8 @@ final class Card {
             title.stringValue = "Agent stopped · \(elapsed)"
             action.stringValue = "No further desktop input this session. Restart the server to resume."
             pauseButton.isEnabled = false
-            stopButton.isEnabled = false
+            stopButton.title = "Close"
+            stopButton.isEnabled = true
         case "paused":
             dot.layer?.backgroundColor = NSColor.systemOrange.cgColor
             if frame?.reason == "takeover" {
@@ -247,10 +254,12 @@ final class Card {
             }
             pauseButton.title = "Resume"
             pauseButton.isEnabled = true
+            stopButton.title = "Stop"
             stopButton.isEnabled = true
         default:
             pauseButton.title = "Pause"
             pauseButton.isEnabled = true
+            stopButton.title = "Stop"
             stopButton.isEnabled = true
             if frame?.waiting == "user_active" {
                 dot.layer?.backgroundColor = NSColor.systemOrange.cgColor
@@ -267,7 +276,8 @@ final class Card {
                 action.stringValue = current(frame) ?? (keys.map { "Idle · \($0) stops it from any app" } ?? "Idle")
             }
         }
-        stopButton.toolTip = chordLabel(frame?.chord).map { "Stop the agent for this session (or press \($0) anywhere)" }
+        stopButton.toolTip = control == "stopped" ? "Close this card; the agent stays stopped"
+            : chordLabel(frame?.chord).map { "Stop the agent for this session (or press \($0) anywhere)" }
             ?? "Stop the agent for this session"
         let recent = frame?.recent ?? []
         for (index, line) in recentLines.enumerated() {

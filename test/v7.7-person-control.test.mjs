@@ -123,3 +123,14 @@ test('a locked screen refuses actions and captures by name; reads that do not ca
   assert.equal(position.isError, undefined, 'a read that captures nothing still works')
   session.close()
 })
+
+test('after Stop the card offers Close, which dismisses it without resuming anything (macOS and Windows sources)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const swift = readFileSync(new URL('../libexec/macos-status-card.swift', import.meta.url), 'utf8')
+  assert.match(swift, /if readControl\(\) == "stopped" \{\s*NSApp\.terminate\(nil\)/, 'a click once stopped closes the card')
+  assert.match(swift, /case "stopped":[\s\S]*?stopButton\.title = "Close"\s*stopButton\.isEnabled = true/, 'the stopped card shows an enabled Close')
+  assert.doesNotMatch(swift, /if readControl\(\) == "stopped" \{[^}]*writeControl\("running"/, 'closing never writes running')
+  const ps1 = readFileSync(new URL('../libexec/windows-status-card.ps1', import.meta.url), 'utf8')
+  assert.match(ps1, /\$stop\.Add_Click\(\{ if \(\(Read-Control\) -eq 'stopped'\) \{ \$window\.Close\(\) \}/)
+  assert.match(ps1, /'stopped' \{[^\n]*\$stop\.Content = 'Close'; \$stop\.IsEnabled = \$true/)
+})

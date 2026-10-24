@@ -193,6 +193,13 @@ try {
   check('every mutation is refused after Stop', stopped.error === 'stopped_by_user', stopped.error)
   const readAfter = parse(await client.callTool('list_windows', {}))
   check('reads still work after Stop', Array.isArray(readAfter.windows))
+  // 7.7.0: after Stop the button reads Close; it dismisses the card and the agent stays stopped.
+  personClicks(centre(card.buttons.stop))
+  await sleep(1000)
+  const cardLeft = (() => { try { return execSync('pgrep -fl macos-status-card', { encoding: 'utf8' }).trim() } catch { return '' } })()
+  check('Close dismisses the card after Stop', cardLeft === '', cardLeft)
+  status = parse(await client.callTool('control_status', {}))
+  check('the agent stays stopped after the card is closed', status.state === 'stopped', `state ${status.state}`)
 } catch (error) {
   check('no unexpected error', false, error instanceof Error ? error.stack ?? error.message : String(error))
 } finally {

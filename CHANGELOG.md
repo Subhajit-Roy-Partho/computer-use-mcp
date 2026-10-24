@@ -22,7 +22,9 @@ tracked in [`docs/specs/v7.7/tasks.md`](docs/specs/v7.7/tasks.md). 7.6.2 was nev
   or types during an action, the agent pauses with `taken_over` and resumes 5 s after they stop
   (`COMPUTER_USE_TAKEOVER=false` turns this off). A locked screen, a disconnected Remote Desktop session and the
   Windows secure desktop are refused by name (`screen_locked`, `session_disconnected`, `secure_desktop`). The display
-  is kept awake while an agent works and released after ten quiet minutes (`COMPUTER_USE_KEEP_AWAKE=false`).
+  is kept awake while an agent works and released after ten quiet minutes (`COMPUTER_USE_KEEP_AWAKE=false`). After
+  Stop, the card's Stop button reads Close: it dismisses the card and the agent stays stopped (the card used to stay on
+  screen, with both buttons disabled, until the server exited).
 - **Windows geometry and capture.** The process is per-monitor DPI aware (v2), so input, window bounds, displays,
   captures and UI Automation share one physical coordinate space (`COMPUTER_USE_WINDOWS_DPI_AWARENESS=unaware` restores
   the old behaviour). A window capture tries `PrintWindow` (full content), then Windows.Graphics.Capture, then a crop of

@@ -74,7 +74,8 @@ chars in Safari · Login"; typed text is never shown), the last few actions with
 - **Pause** refuses every new mutating call with `paused_by_user` and aborts the one in flight; observation tools keep
   working. **Resume** lets mutations through again.
 - **Stop** does the same for the rest of the session (`stopped_by_user`) and trips the native emergency-stop latch, so a
-  drag or a hold stops mid-gesture. Restart the server to resume.
+  drag or a hold stops mid-gesture. Restart the server to resume. Since 7.7 the button then reads **Close**: it dismisses
+  the card, and the agent stays stopped (the server does not open the card again in that session).
 - The card also says when the agent is waiting for you to stop typing (`user_active`) or for an approval.
 - `control_status` (core, read-only) returns the state, since when, and what the agent is waiting on. An agent that
   receives `paused_by_user` should wait and retry or report; one that receives `stopped_by_user` should report what it
