@@ -295,3 +295,12 @@ test('hold_key caps the duration at MAX_HOLD_SECONDS and says so', async () => {
   assert.equal(f.native.calls.find(call => call[0] === 'hold')[2], 2000)
   assert.equal(short.content[0].text, 'Held')
 })
+
+test('long text is typed, not pasted, when the clipboard holds an image or files (7.7.0 K9)', async () => {
+  const f = fixture()
+  f.native.clipboardHasNonText = () => true
+  const result = await f.handler.handle('type', { text: 'line one\nline two' })
+  assert.deepEqual(f.native.calls, [['type', 'line one\nline two']], 'no clipboard write, no paste')
+  assert.match(result.content[0].text, /typed rather than pasted, to keep them/)
+  assert.equal(f.clipboard(), 'original')
+})

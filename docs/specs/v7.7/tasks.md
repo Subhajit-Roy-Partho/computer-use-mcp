@@ -55,7 +55,7 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 | M4 | The agent pointer overlay is excluded from screen capture (macOS `sharingType`, Windows display affinity) | todo | | |
 | M5 | The capture helper honours `--region`; `wait_for_stable` reports `regionApplied: true` | todo | | |
 | M6 | macOS 27's "Device Control and Data Access" named beside "Accessibility" | todo | | |
-| L1 | Linux shell-outs never inherit the MCP stdout | todo | | |
+| L1 | Linux shell-outs never inherit the MCP stdout | in progress | `linux_tools.rs`; mouse, keyboard, clipboard (`wl-copy`, `xclip` with null stdio). Screenshot, windows and apps next | cargo check (Linux); Rust linux_tools tests on CI |
 | L2 | A missing Linux tool (`xdotool`, `ydotool`, `wmctrl`, `xclip`, `scrot`) is a named error | todo | | |
 | L3 | Linux honours JPEG quality | todo | | |
 | A1 | Stringified coordinate arrays (`"[100,200]"`) are coerced | todo | | |
@@ -72,7 +72,7 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 | K6 | Windows geometry and capture: per-monitor DPI v2 awareness and one coordinate contract; window capture `PrintWindow` → Windows.Graphics.Capture → crop with an occlusion flag → refusal for minimised; every output; HWND-precise restore | in progress | `dpi.rs` per-monitor v2; `display.rs` physical coordinates, primary first; `windows.rs` visible bounds, cloaked; `capture_win.rs` ladder and every monitor; `screenshot-handlers.ts` exact mapping, `display_id` | cargo check (Windows); session-screenshot-handlers; hardware check pending |
 | K7 | Wayland foundations: portal and GNOME Shell screenshots; a window list that does not need `Shell.Eval`; backends named in `doctor`; a libei design note | todo | | |
 | K8 | macOS capture speed: ScreenCaptureKit display capture replaces `screencapture` + `sips`; `wait_for_text` polls with fast OCR and confirms with accurate; autorelease pools | todo | | |
-| K9 | Carried over: clipboard guard for non-text contents; `run_script` completes on exit plus a grace period; `scrape` refuses private hosts; filesystem search is async and cancellable | in progress | `spawn.ts` `EXIT_GRACE_MS` (done); clipboard guard, scrape, async search next | v7.7-spawn |
+| K9 | Carried over: clipboard guard for non-text contents; `run_script` completes on exit plus a grace period; `scrape` refuses private hosts; filesystem search is async and cancellable | done | `clipboard.rs` `clipboard_has_non_text` (macOS, Windows, Linux) and `type` types instead of pasting over it; `spawn.ts` `EXIT_GRACE_MS`; `url-guard.ts` public addresses only, each redirect checked; `admin-handlers.ts` async, cancellable search | session-input-handlers; v7.7-spawn; session-admin-handlers (3 new); progress (no longer flaky) |
 
 ## V. Release
 

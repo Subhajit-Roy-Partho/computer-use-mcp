@@ -371,6 +371,8 @@ export interface NativeModule {
   readClipboard?(): string
   /** Write text to clipboard (Windows native). Undefined on macOS. */
   writeClipboard?(text: string): void
+  /** 7.7.0 (K9): the clipboard holds an image, a PDF or files (every platform). */
+  clipboardHasNonText?(): boolean
   /** Draw annotations and grid lines on an image. Cross-platform. */
   annotateImage(base64Jpeg: string, annotations: string | null, gridCols: number | null, gridRows: number | null, quality: number | null): { base64: string; width: number; height: number; mimeType: string }
   /** Crop a region from a base64 image at full resolution. Cross-platform. */

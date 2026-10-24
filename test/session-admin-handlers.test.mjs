@@ -51,6 +51,7 @@ test('extracted registry handler encodes quoted values without shell interpolati
 
 test('extracted scrape handler strips active markup and truncates through injected fetch', async () => {
   const result = await handleAdminTool('scrape', { url: 'https://fixture.invalid' }, context({
+    lookup: async () => ['93.184.215.14'],
     fetch: async () => ({
       ok: true, status: 200, statusText: 'OK',
       text: async () => '<style>private-style</style><script>private-script</script><p>Hello &amp; safe</p>',
@@ -287,4 +288,41 @@ test('process_kill list on Windows reads tasklist, sorts by memory and honours l
   }))
   assert.equal(failed.structuredContent.error, 'process_list_failed')
   assert.equal(failed.structuredContent.message, 'access denied')
+})
+
+// ── 7.7.0 (K9): scrape fetches public addresses only, and checks every redirect ───────────────────────────
+import { checkFetchUrl, privateAddressReason } from '../dist/session/url-guard.js'
+
+test('scrape refuses loopback, link-local, private and local names, with what to do instead', async () => {
+  const fetched = []
+  const ctx = context({ lookup: async host => (host === 'router.example' ? ['192.168.1.1'] : ['93.184.215.14']), fetch: async url => { fetched.push(String(url)); return { ok: true, status: 200, text: async () => 'x', headers: { get: () => null } } } })
+  for (const url of ['http://127.0.0.1:8080/admin', 'http://169.254.169.254/latest/meta-data/', 'http://[::1]/', 'http://localhost:3000', 'https://router.example/', 'file:///etc/passwd']) {
+    const result = await handleAdminTool('scrape', { url }, ctx)
+    assert.equal(result.isError, true, url)
+    assert.equal(result.structuredContent.error, 'url_not_allowed', url)
+    assert.match(result.structuredContent.remediation[0], /COMPUTER_USE_SCRAPE_ALLOW_PRIVATE/)
+  }
+  assert.deepEqual(fetched, [], 'nothing private was fetched')
+})
+
+test('a public page that redirects to a private address is stopped at the redirect', async () => {
+  const fetched = []
+  const result = await handleAdminTool('scrape', { url: 'https://public.example/start' }, context({
+    lookup: async () => ['93.184.215.14'],
+    fetch: async url => {
+      fetched.push(String(url))
+      return { ok: false, status: 302, statusText: 'Found', headers: { get: name => (name === 'location' ? 'http://169.254.169.254/latest' : null) }, text: async () => '' }
+    },
+  }))
+  assert.equal(result.structuredContent.error, 'url_not_allowed')
+  assert.deepEqual(fetched, ['https://public.example/start'])
+})
+
+test('the address classes, and the opt-ins', async () => {
+  for (const address of ['10.0.0.1', '172.16.5.4', '172.31.255.1', '192.168.0.1', '127.0.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', 'fe80::1', 'fd00::1', '::ffff:10.1.2.3']) {
+    assert.ok(privateAddressReason(address), address)
+  }
+  for (const address of ['93.184.215.14', '172.32.0.1', '8.8.8.8', '2606:4700::1111']) assert.equal(privateAddressReason(address), undefined, address)
+  assert.equal((await checkFetchUrl('http://127.0.0.1/', { env: { COMPUTER_USE_SCRAPE_ALLOW_PRIVATE: 'true' } })).ok, true)
+  assert.equal((await checkFetchUrl('http://wiki.internal/', { env: { COMPUTER_USE_SCRAPE_ALLOWED_HOSTS: 'wiki.internal' } })).ok, true)
 })

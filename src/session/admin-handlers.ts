@@ -4,6 +4,7 @@ import * as path from 'node:path'
 import { createHash, type Hash } from 'node:crypto'
 import { enforceFsRoots, openWithinRoots } from './fs-jail.js'
 import type { SpawnBounded } from './spawn.js'
+import { guardedFetch, type Lookup } from './url-guard.js'
 import { errJson, ok, platformUnsupported, type ToolResult } from '../result.js'
 
 export interface AdminHandlerContext {
@@ -14,6 +15,8 @@ export interface AdminHandlerContext {
   signal?: AbortSignal
   onProgress?: (update: { progress: number; total?: number; message?: string }) => void
   fetch?: typeof globalThis.fetch
+  /** 7.7.0: host-name resolution for scrape's address check (tests inject one). */
+  lookup?: Lookup
   /** Negotiated MCP client roots. Undefined means the client does not support roots. */
   clientRoots?: readonly string[]
 }
@@ -189,22 +192,25 @@ export async function handleAdminTool(
       const pattern = typeof args.pattern === 'string' ? args.pattern : '*'
       const matches: string[] = []
       let scanned = 0
-      const walk = (directory: string) => {
+      // 7.7.0 (K9): an asynchronous walk. The synchronous one held the event loop for the whole tree, so neither a
+      // cancellation nor the person's Stop could reach it, and progress notifications queued up behind it.
+      const walk = async (directory: string): Promise<void> => {
         if (context.signal?.aborted) return
-        try {
-          for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-            if (context.signal?.aborted) return
-            const full = path.join(directory, entry.name)
-            scanned += 1
-            if (context.onProgress && scanned % 25 === 0) {
-              context.onProgress({ progress: scanned, message: `scanned ${scanned} entries, ${matches.length} matches` })
-            }
-            if (pattern === '*' || entry.name.includes(pattern.replace(/\*/g, ''))) matches.push(full)
-            if (entry.isDirectory() && args.recursive) walk(full)
+        let entries: fs.Dirent[]
+        try { entries = await fs.promises.readdir(directory, { withFileTypes: true }) } catch { return /* inaccessible directory */ }
+        for (const entry of entries) {
+          if (context.signal?.aborted) return
+          const full = path.join(directory, entry.name)
+          scanned += 1
+          if (context.onProgress && scanned % 25 === 0) {
+            context.onProgress({ progress: scanned, message: `scanned ${scanned} entries, ${matches.length} matches` })
           }
-        } catch { /* inaccessible directory */ }
+          if (pattern === '*' || entry.name.includes(pattern.replace(/\*/g, ''))) matches.push(full)
+          if (entry.isDirectory() && args.recursive) await walk(full)
+        }
       }
-      walk(filePath)
+      await walk(filePath)
+      if (context.signal?.aborted) throw new Error(`filesystem search aborted after ${scanned} entries`)
       context.onProgress?.({
         progress: scanned,
         total: scanned,
@@ -358,9 +364,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
       }
     }
     try {
-      const response = await (context.fetch ?? globalThis.fetch)(url, {
+      // 7.7.0 (K9): public addresses only, every redirect hop checked.
+      const response = await guardedFetch(url, {
         headers: { 'User-Agent': 'computer-use-mcp' }, signal: AbortSignal.timeout(15_000),
-      })
+      }, { ...(context.fetch ? { fetch: context.fetch } : {}), ...(context.lookup ? { lookup: context.lookup } : {}) })
+      if (!(response instanceof Response) && 'error' in response) {
+        return errJson({ error: response.error, message: response.message, remediation: response.remediation })
+      }
       if (!response.ok) return { content: [{ type: 'text', text: `HTTP ${response.status}: ${response.statusText}` }], isError: true }
       const html = await response.text()
       const text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')

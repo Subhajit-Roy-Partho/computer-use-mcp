@@ -512,8 +512,15 @@ export class InputHandler {
       }
       let summary = 'Typed'
       if (args.mode === 'keys') summary = await this.#typeKeys(text, signal)
-      else if (text.length > 100 || text.includes('\n')) await this.#pasteText(text)
-      else this.#native.typeText(text)
+      else if (text.length > 100 || text.includes('\n')) {
+        // 7.7.0 (K9): never paste over an image or files the person copied; type the text instead.
+        let guarded = false
+        try { guarded = this.#native.clipboardHasNonText?.() === true } catch { guarded = false }
+        if (guarded) {
+          this.#native.typeText(text)
+          summary = 'Typed (the clipboard holds an image or files, so the text was typed rather than pasted, to keep them)'
+        } else await this.#pasteText(text)
+      } else this.#native.typeText(text)
       if (resolved.bundleId) this.#targets.update(resolved, 'keyboard')
       if (args.press_enter === true || args.press_enter === 'true') {
         this.#native.keyPress('return')
