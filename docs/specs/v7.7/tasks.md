@@ -42,7 +42,7 @@ Status: `todo` → `in progress` → `done` (change + test green) → `blocked` 
 | W4 | `prepare_display` skips cloaked, tool, owned and shell/input windows; restores exactly the windows it minimised | done | `win_util.rs` `is_app_window`; `apps.rs` records the windows it minimised and `unhide_app` restores exactly those, without activating | cargo check (Windows); CI; hardware check before tagging |
 | W5 | `multi_edit` newlines as Enter, not Unicode 0x0A | done | `keyboard.rs` Windows `type_text`: `\n` as VK_RETURN, `\r` skipped | cargo check (Windows); CI |
 | W6 | PowerShell output forced to UTF-8; output decoded across chunk boundaries | done | `scripting-service.ts` `POWERSHELL_UTF8_PREFIX`, every Windows script encoded; `spawn.ts` `StringDecoder` per stream | session-scripting-service; v7.7-spawn |
-| W7 | UI Automation through `CUIAutomation8` with 2 s connection and 5 s transaction timeouts | todo | | |
+| W7 | UI Automation through `CUIAutomation8` with 2 s connection and 5 s transaction timeouts | done | `accessibility.rs` (Windows): `CUIAutomation8` as `IUIAutomation2` with `SetConnectionTimeout(2000)` and `SetTransactionTimeout(5000)`, the original `CUIAutomation` where 8 is missing; one client per thread (the JavaScript thread and each K4 worker) instead of a COM activation per call | cargo check and clippy (Windows target); CI Windows runners |
 | W8 | The user-active guard ignores zero-delta mouse moves | done | `activity.rs`: zero-length moves are not activity (Windows hook, macOS tap, Linux XI2) | cargo check (3 targets) |
 
 ## M. macOS and Linux hygiene (7.6.2 order 8–10)
