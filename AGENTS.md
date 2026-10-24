@@ -14,10 +14,12 @@ This guide covers how to integrate `computer-use-mcp` into AI agent frameworks a
 **Profiles:** `COMPUTER_USE_PROFILE=core|desktop|ax|scripting|windows-admin|full` (default `desktop` since 7.6: core plus the OCR and wait tools and `agent_pointer`; `full` lists everything)
 
 **Current surface (7.6.0):**
-- **Default list.** On macOS the default `desktop` profile lists 40 tools (7.6.1: `unhide_app` joined `core`) and about 44 KB on the wire (about 12k tokens);
-  `COMPUTER_USE_PROFILE=full` lists 76 tools and 84,037 bytes (112,727 before 7.6). Tool counts by profile on macOS:
-  core 37, desktop 40, scripting 43, windows-admin 50, ax 57, full 76 (Windows 35/36/39/48/53/74, Linux 35/36/39/40/53/66).
-  Byte budgets are under test (`desktop` 48,000, `full` 88,000).
+- **Default list.** On macOS the default `desktop` profile lists 37 tools and 44,324 bytes on the wire (about 11k tokens);
+  `COMPUTER_USE_PROFILE=full` lists 78 tools and 82,698 bytes (112,727 before 7.6). 7.7.0 added `run_steps` and lists
+  the click aliases (`left_click`, `double_click` and the rest) only in `full`; they stay callable in every profile.
+  Tool counts by profile on macOS: core 33, desktop 37, scripting 40, windows-admin 47, ax 54, full 78
+  (Windows 31/33/36/45/50/76, Linux 31/33/36/37/50/68). A test derives these from the catalog and checks this file, the
+  README and the computer-use skill. Byte budgets are under test (`desktop` 48,000, `full` 88,000).
 - **Only tools that exist here are listed.** The catalog gives each tool `platforms` and a `job` (`observe`, `act`,
   `semantic`, `script`, `admin`, `browser`, `spaces`, `meta`). `registry` and `notification` are Windows-only;
   `read_window_text`, `click_text`, `wait_for_text` and `wait_for_stable` are macOS-only; the Spaces tools are macOS and
@@ -132,7 +134,7 @@ constant time.
 
 | Variable | Effect |
 |---|---|
-| `COMPUTER_USE_PROFILE` | `core \| desktop \| ax \| scripting \| windows-admin \| full` (default `desktop` since 7.6; on macOS 40 tools against 76 for `full`). Bounds the maximum exposed tool surface. Profiles nest: core, then desktop, then ax, scripting or windows-admin, then full. |
+| `COMPUTER_USE_PROFILE` | `core \| desktop \| ax \| scripting \| windows-admin \| full` (default `desktop` since 7.6; on macOS 37 tools against 78 for `full`). Bounds the maximum exposed tool surface. Profiles nest: core, then desktop, then ax, scripting or windows-admin, then full. |
 | `COMPUTER_USE_ACTIVE_PROFILE` | Starting profile within that bound; may be narrowed at runtime but never widened past `COMPUTER_USE_PROFILE`. |
 | `COMPUTER_USE_NATIVE_PATH` | Override native `.node` resolution (else: separately installed platform package → bundled binary). |
 | `COMPUTER_USE_ADVERTISE_APPROVAL_TOKEN=true` | v7.6: advertise `approval_token` on every mutating tool's schema again, as before 7.6 (off by default; the token is accepted in `_meta` either way). |
@@ -287,7 +289,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { createComputerUseServer } from '@zavora-ai/computer-use-mcp'
 import { connectInProcess } from '@zavora-ai/computer-use-mcp/client'
 
-// Start the MCP server in-process. The default profile is `desktop` (40 tools on macOS, about 12k tokens of
+// Start the MCP server in-process. The default profile is `desktop` (37 tools on macOS, about 11k tokens of
 // schemas); pass createComputerUseServer({ profile: 'full' }) for every tool.
 const server = createComputerUseServer()
 const mcpClient = await connectInProcess(server)
@@ -874,7 +876,7 @@ await client.callTool('scrape', { url: 'https://example.com' })
 Enable it with `runConsole: true` (or run `computer-use-mcp-console`). It adds eight
 tools (`run_start`, `run_plan`, `run_progress`, `run_say`, `run_spend`, `run_cancel`,
 `run_attachment`, `run_console`) and an MCP App at `ui://computer-use/run-console/v1`,
-on top of whatever profile is active (macOS `desktop` 40 to 48, `full` 76 to 84). A plan the agent declares and the frames it captures render live in a
+on top of whatever profile is active (macOS `desktop` 37 to 45, `full` 78 to 86). A plan the agent declares and the frames it captures render live in a
 browser, so a person follows the work instead of a tool log.
 
 ```typescript
@@ -1034,7 +1036,7 @@ usable controls.
 Since 7.6 a tool that does not exist on the running platform is neither listed nor
 callable (`registry` and `notification` only on Windows; the OCR and `wait_for_*` text
 and stability tools only on macOS; Spaces on macOS and Windows), so the tool count
-differs by platform: the default `desktop` profile lists 40 tools on macOS and 36 on
-Windows and Linux, and `full` lists 76, 74 and 66. Before 7.6 such a tool was listed
+differs by platform: the default `desktop` profile lists 37 tools on macOS and 33 on
+Windows and Linux, and `full` lists 78, 76 and 68. Before 7.6 such a tool was listed
 and answered `platform_unsupported`; `get_app_dictionary` and `list_menu_bar` (macOS-only in practice) are still listed on
 Windows and Linux and still answer it.

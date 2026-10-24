@@ -3,11 +3,12 @@
 *Written for 7.2. Annotated for 7.6.0 on 2026-10-09: the text below is still accurate for what it describes, and the two
 sections directly under this note say what has changed since.*
 
-## Current surface (7.6.0)
+## Current surface (7.7.0)
 
 The tool list is what a model sees first, and 7.6 changed it. The default profile is `desktop` (core plus the OCR and wait
-tools and `agent_pointer`): on macOS 39 tools and 45,942 bytes on the wire (about 12k tokens), against 73 tools and
-112,727 bytes for the default list before 7.6; `COMPUTER_USE_PROFILE=full` lists 76 tools and 84,037 bytes. A tool that does not exist
+tools, `agent_pointer` and, since 7.7, `run_steps`): on macOS 37 tools and 44,324 bytes on the wire (about 11k tokens),
+against 73 tools and 112,727 bytes for the default list before 7.6; `COMPUTER_USE_PROFILE=full` lists 78 tools and 82,698
+bytes. 7.7 lists the five click aliases only in `full` (they stay callable everywhere). A tool that does not exist
 on the running platform is neither listed nor callable. There is one `click {button, count}` (the five older click names
 remain callable as aliases), `set_target` / `get_target` for an explicit session target, and three waits
 (`wait_for_window`, `wait_for_text`, `wait_for_stable`) that replace sleep-and-screenshot loops. The server instructions are
