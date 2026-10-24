@@ -13,19 +13,31 @@ This guide covers how to integrate `computer-use-mcp` into AI agent frameworks a
 **MCP prompts:** `diagnose-desktop`, `fill-form`, `script-first`, `safe-desktop-task`  
 **Profiles:** `COMPUTER_USE_PROFILE=core|desktop|ax|scripting|windows-admin|full` (default `desktop` since 7.6: core plus the OCR and wait tools and `agent_pointer`; `full` lists everything)
 
-**Current surface (7.6.0):**
-- **Default list.** On macOS the default `desktop` profile lists 40 tools (7.6.1: `unhide_app` joined `core`) and about 44 KB on the wire (about 12k tokens);
-  `COMPUTER_USE_PROFILE=full` lists 76 tools and 84,037 bytes (112,727 before 7.6). Tool counts by profile on macOS:
-  core 37, desktop 40, scripting 43, windows-admin 50, ax 57, full 76 (Windows 35/36/39/48/53/74, Linux 35/36/39/40/53/66).
-  Byte budgets are under test (`desktop` 48,000, `full` 88,000).
+**Current surface (7.7.0):**
+- **Default list.** On macOS the default `desktop` profile lists 37 tools and 44,324 bytes on the wire (about 11k tokens);
+  `COMPUTER_USE_PROFILE=full` lists 78 tools and 82,698 bytes (112,727 before 7.6). 7.7.0 added `run_steps` and lists
+  the click aliases (`left_click`, `double_click` and the rest) only in `full`; they stay callable in every profile.
+  Tool counts by profile on macOS: core 33, desktop 37, scripting 40, windows-admin 47, ax 54, full 78
+  (Windows 31/33/36/45/50/76, Linux 31/33/36/37/50/68). A test derives these from the catalog and checks this file, the
+  README and the computer-use skill. Byte budgets are under test (`desktop` 48,000, `full` 88,000).
 - **Only tools that exist here are listed.** The catalog gives each tool `platforms` and a `job` (`observe`, `act`,
   `semantic`, `script`, `admin`, `browser`, `spaces`, `meta`). `registry` and `notification` are Windows-only;
   `read_window_text`, `click_text`, `wait_for_text` and `wait_for_stable` are macOS-only; the Spaces tools are macOS and
   Windows. A tool that does not exist on the running platform is neither listed nor callable (before 7.6 it was listed
   and returned `platform_unsupported`).
 - **One `click`.** `click {coordinate, button: left|right|middle, count: 1|2|3}` plus the usual targeting and `delivery`.
-  `left_click`, `right_click`, `middle_click`, `double_click` and `triple_click` remain callable (and listed) as thin
-  aliases of it; they still accept `target_app`, `target_window_id`, `delivery` and `force`. Examples here use `click`.
+  `left_click`, `right_click`, `middle_click`, `double_click` and `triple_click` remain callable in every profile as thin
+  aliases of it (listed only in `full` since 7.7); they still accept `target_app`, `target_window_id`, `delivery` and
+  `force`. Examples here use `click`.
+- **Every action says what happened (7.7).** Each action's result carries `effect` (`verified`, `changed`,
+  `no_visible_change`, `unverified`), `route` and, for input, `delivery` (`hid` or `pid`). Every refusal and every
+  unverified result adds a `hint` and a `next_call`: one read-only call this session can make as is. `verify: true` on
+  an input tool captures before and after. A JSON reply gains these as fields; a text reply keeps its text first and
+  gains a JSON block; both are in `structuredContent`.
+- **`run_steps` (7.7).** Up to 30 steps (`{tool, args}`) in one call: every step validated before any runs, the target
+  focused once, stopped at the first failing step (the rest reported not run), one optional capture at the end. Steps
+  are input, accessibility actions, activation, `write_clipboard` and the waits; scripts and admin tools keep their own
+  call.
 - **Session target.** `set_target {app | window_id | title | clear}` and `get_target` make the target explicit, so input and
   capture tools can omit targeting; `screenshot full_screen: true` captures the whole screen even when a target is set.
 - **Waits.** `wait_for_window`, `wait_for_text` (OCR: text appears, or `gone: true`) and `wait_for_stable` (the window
@@ -34,6 +46,8 @@ This guide covers how to integrate `computer-use-mcp` into AI agent frameworks a
   route order (the app's own API, scripting, accessibility, OCR for self-drawn apps, coordinates last), the user-active
   guard and `delivery`, the waits and the session target. They no longer tell hosts to prefer the accessibility tree,
   which is empty on Unreal, Blender and games. `get_tool_guide(task)` picks the route for a task.
+- **Arguments sent as text (7.7).** `"[100, 200]"`, `"100,200"`, `"500"` and `"true"` are accepted where an array, a
+  number or a flag is declared, but only when the original fails its schema and the coerced value passes.
 - **Requirements.** Node 20 or later. macOS 14 or later for the ScreenCaptureKit capture and the OCR tools. The
   user-active guard reads physical input through an event tap that needs **Input Monitoring** for the host app;
   without it the guard allows every call and `doctor` says its clock is unavailable.
@@ -44,20 +58,24 @@ This guide covers how to integrate `computer-use-mcp` into AI agent frameworks a
 - **Argument validation:** arguments are validated against the advertised input schema at the MCP boundary. Schema defaults are applied before the handler runs, and malformed input returns a structured `invalid_arguments` result listing each offending path — not a JSON-RPC fault. Retry with corrected arguments.
 - **v7.6 wire format:** shared targeting parameters (`target_app`, `target_window_id`, `target_title`, `focus_strategy`, `force`, `delivery`) are one sentence each in the schemas; the guidance is in the server instructions and `get_tool_guide`. `approval_token` is in no tool schema (see *Approval flow* below). Each tool carries two `_meta` fields (`computer-use/focusRequired`, `computer-use/mutates`); `get_tool_metadata` returns the full set, and `COMPUTER_USE_FULL_WIRE_META=true` puts all seven back on the wire.
 - **v7.6 result shapes:** `read_window_text` lines carry `box` (window points) and the result carries `screen_origin` once, so a screen point is `screen_origin + box` (the per-line `screen` rectangle is gone). `get_app_capabilities` reports `accessibility: { nodes, hasControls }`, and `accessible` now means `hasControls` (before, any app with a window said `accessible: true`).
-- **v7.6 capture helper:** window capture and OCR run through a Swift ScreenCaptureKit helper. Two captures at once used to hang, so helper runs are serialised within a server and across servers (an advisory lock at `~/Library/Caches/computer-use-mcp/helper.lock`; a call waits for a live holder, takes the lock over from a dead one, and gives up with `helper_busy`). A helper killed by the timeout is reported as `helper_timeout`; the helper itself gives up on a stalled capture after 10 s with `sck_timeout`.
+- **Capture helper (v7.6, faster in 7.7):** window capture, OCR and, since 7.7, full-screen `screenshot` and `zoom` run through a Swift ScreenCaptureKit helper (it replaced `screencapture` and `sips`; `display_id` picks a display, an unknown one is `display_not_found`; the status card and the server's pointer overlay are left out). Each server keeps one helper running between calls (`serve`), stopped after 30 s idle, on a timeout, a cancel or a stall; `COMPUTER_USE_HELPER_SERVE=false` starts one per call. Measured on macOS 26.2: 62 ms per warm capture, 112-128 ms per `screenshot`. Two captures at once used to hang, so helper calls are serialised within a server and across servers (an advisory lock at `~/Library/Caches/computer-use-mcp/helper.lock`; a call waits for a live holder, takes the lock over from a dead one, and gives up with `helper_busy`). A helper killed by the timeout is reported as `helper_timeout`; the helper gives up on a stalled capture after 10 s with `sck_timeout`. `zoom` without a target takes its region in screen points.
+- **Unchanged captures (7.7):** a capture identical to the last one sent returns a short text instead of the same image, up to three times in a row; `resend: true` or `COMPUTER_USE_RESEND_UNCHANGED=true` sends the image anyway.
+- **Off the event loop (7.7):** accessibility walks, element searches, menu bars, captures and (Windows, Linux) activation run on a worker thread, so Stop, cancellation and other requests are answered while they run. macOS walks wait at most 0.5 s per message and 5 s per walk (`timedOut` on a tree, `ax_timeout` on an empty search); Windows UI Automation waits at most 2 s to connect and 5 s per request.
 - **v7.6 fixes worth knowing:** the user-active guard no longer refuses the first input call of a fresh server (its clock is seeded from the system's HID idle counter). `process_kill` refuses `pid` below 2 and matches `name` exactly; an ambiguous name returns `ambiguous_name` unless `all: true`. `hold_key` is capped at 10 s. Empty or non-numeric `COMPUTER_USE_MAX_TASKS`, `COMPUTER_USE_TASK_TTL_MS` and `COMPUTER_USE_TASK_POLL_INTERVAL_MS` fall back to their defaults with a stderr note instead of ending start-up.
 - **v7.6 launcher:** `dist/launch.js` is the package `bin`. It imports only Node built-ins, checks that `node_modules`, `dist/server.js` and the native addon exist, and when one is missing prints the fix (`npm ci`, `npm run build:ts`, `npm run build:native`) to stderr and exits 2, instead of the host seeing "connection closed" with no reason. `npm run build:ts` builds into `dist.next` and swaps it in, so a server starting mid-build still finds `dist/`.
 
-## The status card: a person can see, pause and stop the agent (7.6.1)
+## The status card: a person can see, pause and stop the agent (7.6.1; on by default on macOS in 7.7)
 
-Set `COMPUTER_USE_STATUS_CARD=true` and a small always-on-top card appears on the first desktop action: "Agent is using
+On macOS (and on Windows with `COMPUTER_USE_STATUS_CARD=true`) a small always-on-top card appears on the first desktop
+action; `COMPUTER_USE_STATUS_CARD=false` turns it off. It shows "Agent is using
 this Mac · 1:42", the current action as the server resolved it ("click (640, 410) in TextEdit · Untitled", "type 24
 chars in Safari · Login"; typed text is never shown), the last few actions with ✓/✕, and two buttons.
 
 - **Pause** refuses every new mutating call with `paused_by_user` and aborts the one in flight; observation tools keep
   working. **Resume** lets mutations through again.
 - **Stop** does the same for the rest of the session (`stopped_by_user`) and trips the native emergency-stop latch, so a
-  drag or a hold stops mid-gesture. Restart the server to resume.
+  drag or a hold stops mid-gesture. Restart the server to resume. Since 7.7 the button then reads **Close**: it dismisses
+  the card, and the agent stays stopped (the server does not open the card again in that session).
 - The card also says when the agent is waiting for you to stop typing (`user_active`) or for an approval.
 - `control_status` (core, read-only) returns the state, since when, and what the agent is waiting on. An agent that
   receives `paused_by_user` should wait and retry or report; one that receives `stopped_by_user` should report what it
@@ -67,6 +85,21 @@ chars in Safari · Login"; typed text is never shown), the last few actions with
 - macOS: a Swift panel compiled on first use (needs the Xcode Command Line Tools, like the capture helper). Windows:
   PowerShell and WPF (the lineage of PR #40). Linux: the control state and `control_status` work; there is no card yet.
 - `doctor` reports `status_card`. Hosts embedding the server can drive the same state through `SessionOptions.operatorControl`.
+
+7.7 adds the rest of a person's control, on by default:
+
+- **The emergency chord** `ctrl+alt+escape` stops the agent on macOS and Windows (the card shows it).
+  `COMPUTER_USE_EMERGENCY_CHORD` names another chord; `off` disarms it.
+- **Taking over pauses the agent.** Deliberate physical input during an action (a click, a key, or a real mouse
+  movement; zero-length moves do not count) pauses the agent with `taken_over`. It resumes by itself 5 s after the
+  person stops, and the card says "You took over". `COMPUTER_USE_TAKEOVER=false` turns this off, for a host that moves
+  the mouse itself.
+- **A locked screen is refused by name.** Input and capture return `screen_locked`, `session_disconnected` (Remote
+  Desktop) or `secure_desktop` (Windows UAC and the lock screen) with what to do.
+- **The display stays awake** while the agent works, released after ten quiet minutes or when the server stops
+  (`COMPUTER_USE_KEEP_AWAKE=false` turns it off).
+- **The pointer overlay** (`agent_pointer`) is never in a capture: `NSWindowSharingNone` on macOS,
+  `WDA_EXCLUDEFROMCAPTURE` on Windows.
 
 ## Default security posture
 
@@ -132,7 +165,7 @@ constant time.
 
 | Variable | Effect |
 |---|---|
-| `COMPUTER_USE_PROFILE` | `core \| desktop \| ax \| scripting \| windows-admin \| full` (default `desktop` since 7.6; on macOS 40 tools against 76 for `full`). Bounds the maximum exposed tool surface. Profiles nest: core, then desktop, then ax, scripting or windows-admin, then full. |
+| `COMPUTER_USE_PROFILE` | `core \| desktop \| ax \| scripting \| windows-admin \| full` (default `desktop` since 7.6; on macOS 37 tools against 78 for `full`). Bounds the maximum exposed tool surface. Profiles nest: core, then desktop, then ax, scripting or windows-admin, then full. |
 | `COMPUTER_USE_ACTIVE_PROFILE` | Starting profile within that bound; may be narrowed at runtime but never widened past `COMPUTER_USE_PROFILE`. |
 | `COMPUTER_USE_NATIVE_PATH` | Override native `.node` resolution (else: separately installed platform package → bundled binary). |
 | `COMPUTER_USE_ADVERTISE_APPROVAL_TOKEN=true` | v7.6: advertise `approval_token` on every mutating tool's schema again, as before 7.6 (off by default; the token is accepted in `_meta` either way). |
@@ -142,7 +175,14 @@ constant time.
 | `COMPUTER_USE_PREPARE_KEEP_VISIBLE` | Comma-separated bundle IDs that `focus_strategy: "prepare_display"` must not hide. Defaults to the target plus the terminal. |
 | `COMPUTER_USE_SPACES_BACKEND` | `auto \| yabai \| mission_control \| cgs` — virtual-desktop backend selection on macOS. |
 | `COMPUTER_USE_PROVIDER`, `COMPUTER_USE_WIDTH`, `COMPUTER_USE_QUALITY`, `COMPUTER_USE_VISION` | Screenshot defaults: provider preset, width, JPEG quality (`0` = PNG), and whether vision is enabled. |
-| `COMPUTER_USE_STATUS_CARD` | 7.6.1: `true` shows the desktop status card (macOS, Windows): what the agent is doing, Pause/Resume, Stop. Off by default in 7.6.1. The card never appears in screenshots and closes when the server exits. |
+| `COMPUTER_USE_STATUS_CARD` | The desktop status card (macOS, Windows): what the agent is doing, Pause/Resume, Stop. 7.7: on by default on macOS (`false` turns it off), opt-in (`true`) on Windows. The card never appears in screenshots and closes when the server exits. |
+| `COMPUTER_USE_EMERGENCY_CHORD` | 7.7: the chord that stops the agent (default `ctrl+alt+escape` on macOS and Windows); `off` disarms it. |
+| `COMPUTER_USE_TAKEOVER` | 7.7: `false` stops deliberate physical input from pausing the agent (`taken_over`). On by default. |
+| `COMPUTER_USE_KEEP_AWAKE` | 7.7: `false` stops the server keeping the display awake while an agent works. |
+| `COMPUTER_USE_HELPER_SERVE` | 7.7 (macOS): `false` starts the capture helper once per call instead of keeping one running. |
+| `COMPUTER_USE_RESEND_UNCHANGED` | 7.7: `true` sends a capture's image even when it is identical to the last one sent. |
+| `COMPUTER_USE_SCRAPE_ALLOW_PRIVATE`, `COMPUTER_USE_SCRAPE_ALLOWED_HOSTS` | 7.7: `scrape` fetches public addresses only (each redirect checked). `true` lifts the rule; a comma-separated host list allows those hosts whatever they resolve to. |
+| `COMPUTER_USE_WINDOWS_DPI_AWARENESS` | 7.7 (Windows): the process is per-monitor DPI aware (v2), so every coordinate is a physical pixel; `unaware` restores the coordinates virtualised to 96 DPI. |
 | `COMPUTER_USE_USER_IDLE_MS` | v7.5: refuse to activate an app or post keyboard/mouse input within this many ms of the user's last physical input (default `4000` on macOS; `0` disables; Windows and Linux only when set). Such a call returns `user_active` unless it passes `force: true` or uses `delivery: "pid"`. The guard needs Input Monitoring for the host app; without it the guard allows everything and `doctor` reports the clock as unavailable. |
 
 ### Hosting and runtime
@@ -234,7 +274,8 @@ checkout's `dist/server.js` to run a source build.
 
 **Cursor is the host process on macOS.** Cursor spawns the server, so macOS
 attributes every permission to Cursor — not to `node`, `npx` or your terminal.
-Enable **Cursor** in System Settings › Privacy & Security › **Accessibility** and
+Enable **Cursor** in System Settings › Privacy & Security › **Accessibility** (on macOS 27 and later
+**Device Control and Data Access**) and
 **Screen & System Audio Recording**, allow it under **Automation** when
 `run_script` first targets an app, then restart Cursor. Without Accessibility,
 input tools refuse with `accessibility_permission_denied` rather than silently
@@ -286,7 +327,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { createComputerUseServer } from '@zavora-ai/computer-use-mcp'
 import { connectInProcess } from '@zavora-ai/computer-use-mcp/client'
 
-// Start the MCP server in-process. The default profile is `desktop` (40 tools on macOS, about 12k tokens of
+// Start the MCP server in-process. The default profile is `desktop` (37 tools on macOS, about 11k tokens of
 // schemas); pass createComputerUseServer({ profile: 'full' }) for every tool.
 const server = createComputerUseServer()
 const mcpClient = await connectInProcess(server)
@@ -657,8 +698,8 @@ await client.callTool('wait_for_text', { target_app: 'com.epicgames.UnrealEditor
 await client.callTool('wait_for_stable', { target_app: 'org.blenderfoundation.blender', quiet_ms: 800 })
 ```
 
-`wait_for_stable` hashes the whole window: `region` is accepted but reported as `regionApplied: false` until the capture
-helper can crop, and `quiet_ms: 0` returns after one capture with its hash. On a timeout the error says what was last
+`wait_for_stable` hashes the whole window, or only `region` (the helper crops it; `regionApplied: true` since 7.7), and
+`quiet_ms: 0` returns after one capture with its hash. On a timeout the error says what was last
 seen (the last lines read, or how many changes happened).
 
 ### Screenshot before acting
@@ -873,7 +914,7 @@ await client.callTool('scrape', { url: 'https://example.com' })
 Enable it with `runConsole: true` (or run `computer-use-mcp-console`). It adds eight
 tools (`run_start`, `run_plan`, `run_progress`, `run_say`, `run_spend`, `run_cancel`,
 `run_attachment`, `run_console`) and an MCP App at `ui://computer-use/run-console/v1`,
-on top of whatever profile is active (macOS `desktop` 40 to 48, `full` 76 to 84). A plan the agent declares and the frames it captures render live in a
+on top of whatever profile is active (macOS `desktop` 37 to 45, `full` 78 to 86). A plan the agent declares and the frames it captures render live in a
 browser, so a person follows the work instead of a tool log.
 
 ```typescript
@@ -919,7 +960,11 @@ Four things worth knowing:
 
 `web_search` returns ranked results and `scrape` reads one page. Both execute
 locally, so they work with any model rather than only those whose provider offers a
-server-side search tool. Configure a provider for real use:
+server-side search tool. Since 7.7 `scrape` fetches public addresses only: a page can
+tell an agent to fetch a URL, so loopback, private networks and the cloud metadata
+address are refused, every address a name resolves to is checked, and so is each
+redirect (`COMPUTER_USE_SCRAPE_ALLOW_PRIVATE`, `COMPUTER_USE_SCRAPE_ALLOWED_HOSTS` opt
+back in). Configure a provider for real use:
 
 | Variable | Effect |
 |---|---|
@@ -1033,7 +1078,7 @@ usable controls.
 Since 7.6 a tool that does not exist on the running platform is neither listed nor
 callable (`registry` and `notification` only on Windows; the OCR and `wait_for_*` text
 and stability tools only on macOS; Spaces on macOS and Windows), so the tool count
-differs by platform: the default `desktop` profile lists 40 tools on macOS and 36 on
-Windows and Linux, and `full` lists 76, 74 and 66. Before 7.6 such a tool was listed
+differs by platform: the default `desktop` profile lists 37 tools on macOS and 33 on
+Windows and Linux, and `full` lists 78, 76 and 68. Before 7.6 such a tool was listed
 and answered `platform_unsupported`; `get_app_dictionary` and `list_menu_bar` (macOS-only in practice) are still listed on
 Windows and Linux and still answer it.

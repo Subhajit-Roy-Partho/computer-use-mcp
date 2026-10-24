@@ -34,7 +34,7 @@ function fixture({ delayMs = 30 } = {}) {
 }
 
 async function helperFor(f, extra = {}) {
-  const helper = createMacosHelper({ sourcePath: f.source, cacheDir: f.dir, platform: 'darwin', darwinRelease: '25.2.0', run: f.run, ...extra })
+  const helper = createMacosHelper({ sourcePath: f.source, cacheDir: f.dir, platform: 'darwin', darwinRelease: '25.2.0', run: f.run, serve: false, ...extra })
   const availability = await helper.ensure()
   assert.equal(availability.ok, true, JSON.stringify(availability))
   return helper

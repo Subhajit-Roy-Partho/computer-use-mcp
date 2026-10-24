@@ -2,6 +2,7 @@ import { z, type ZodTypeAny } from 'zod'
 import { errJson, okJson } from '../result.js'
 import { RUN_STEP_TOOLS, TOOL_CATALOG, getToolMeta, toToolMetaPublic, type ToolMeta } from '../tool-catalog.js'
 import type { ToolRegistry } from './registry.js'
+import { coerceToShape } from './coerce.js'
 
 // v7.6 R7: one sentence per shared parameter; the guidance lives in the server instructions and get_tool_guide.
 const targetAppParam = z.string().optional().describe('Target app: bundle ID (macOS) or process name (Windows).')
@@ -384,7 +385,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
   }, NONE_READ)
 
   // v7.6 R3: waits that replace sleep-and-screenshot loops (macOS: OCR and ScreenCaptureKit)
-  tool('wait_for_text', 'macOS. Wait until text appears in a window (or, with gone: true, disappears), polling the on-device OCR (default every 500 ms, minimum 200). Returns the matched line with its box in window points and its screen point, as soon as it matches; on timeout an error listing the last lines read. Does not activate the app or move the cursor. Use instead of sleeping and taking screenshots.', {
+  tool('wait_for_text', 'macOS. Wait until text appears in a window (or, with gone: true, disappears), polling the on-device OCR (default every 500 ms, minimum 200; fast recognition, confirmed with accurate before it returns). Returns the matched line with its box in window points and its screen point, as soon as it matches; on timeout an error listing the last lines read. Does not activate the app or move the cursor. Use instead of sleeping and taking screenshots.', {
     text: z.string().min(1).describe('Text to wait for'),
     match: z.enum(['exact', 'contains', 'regex']).optional().default('contains').describe('exact: the whole line; contains: a case-insensitive substring; regex: a case-insensitive JavaScript regular expression'),
     gone: z.boolean().optional().default(false).describe('Wait for the text to disappear instead'),
@@ -563,6 +564,18 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
       text: z.string().min(1).max(200).optional().describe('Match a control by label, placeholder, name or id'),
       max_results: z.number().int().min(1).max(50).optional().default(10).describe('How many matches to return'),
     }, NONE_READ)
+}
+
+/** 7.7.0 (A1): direct session calls get the same coercions as the MCP boundary (`coerce.ts`). */
+let schemasByTool: Map<string, Record<string, ZodTypeAny>> | undefined
+
+export function coerceArguments(name: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (!schemasByTool) {
+    schemasByTool = new Map()
+    defineV7Tools({ getMeta: getToolMeta, define(definition) { schemasByTool!.set(definition.name, definition.inputSchema) } })
+  }
+  const shape = schemasByTool.get(name)
+  return shape ? coerceToShape(shape, args) : args
 }
 
 // Share advertised defaults with direct session calls and nested compatibility actions.

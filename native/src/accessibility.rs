@@ -81,16 +81,46 @@ mod platform;
 #[cfg(target_os = "windows")]
 mod platform {
     use napi_derive::napi;
+    use windows::core::Interface;
     use windows::Win32::Foundation::*;
     use windows::Win32::System::Com::*;
     use windows::Win32::UI::Accessibility::*;
 
-    fn uia() -> napi::Result<IUIAutomation> {
+    /// 7.7.0 (W7): how long UI Automation may wait to reach an app, and for one request to finish. A hung or busy app
+    /// otherwise held a tree walk or an element search for the library's own timeouts; these return an error instead.
+    const UIA_CONNECTION_TIMEOUT_MS: u32 = 2_000;
+    const UIA_TRANSACTION_TIMEOUT_MS: u32 = 5_000;
+
+    thread_local! {
+        // One client per thread (the JavaScript thread and each worker, K4): creating it is a COM activation per call.
+        static UIA: std::cell::RefCell<Option<IUIAutomation>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// UI Automation 8 (Windows 8 and later) with the timeouts above; the original client where it is missing.
+    fn create_uia() -> napi::Result<IUIAutomation> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if let Ok(client) = CoCreateInstance::<_, IUIAutomation2>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
+                let _ = client.SetConnectionTimeout(UIA_CONNECTION_TIMEOUT_MS);
+                let _ = client.SetTransactionTimeout(UIA_TRANSACTION_TIMEOUT_MS);
+                return client
+                    .cast::<IUIAutomation>()
+                    .map_err(|e| napi::Error::from_reason(format!("IUIAutomation init: {e}")));
+            }
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| napi::Error::from_reason(format!("IUIAutomation init: {e}")))
         }
+    }
+
+    fn uia() -> napi::Result<IUIAutomation> {
+        UIA.with(|cell| {
+            if let Some(client) = cell.borrow().as_ref() {
+                return Ok(client.clone());
+            }
+            let client = create_uia()?;
+            *cell.borrow_mut() = Some(client.clone());
+            Ok(client)
+        })
     }
 
     fn control_type_to_role(ct: UIA_CONTROLTYPE_ID) -> &'static str {

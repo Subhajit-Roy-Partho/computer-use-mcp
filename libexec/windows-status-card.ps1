@@ -84,7 +84,8 @@ $pause.Add_Click({
   if ($mode -eq 'stopped') { return }
   Write-Control $(if ($mode -eq 'paused') { 'running' } else { 'paused' })
 })
-$stop.Add_Click({ Write-Control 'stopped' })
+# 7.7.0: once stopped, the button reads Close and dismisses the card; the server keeps the stopped state.
+$stop.Add_Click({ if ((Read-Control) -eq 'stopped') { $window.Close() } else { Write-Control 'stopped' } })
 
 function Describe($item) {
   $text = [string]$item.label
@@ -118,7 +119,7 @@ $timer.Add_Tick({
   }
   $current = if ($null -ne $script:frame -and $script:frame.action) { Describe $script:frame.action } else { 'Idle' }
   switch ($state) {
-    'stopped' { $dot.Fill = '#D64545'; $title.Text = "Agent stopped · $elapsed"; $action.Text = 'No further desktop input this session. Restart the server to resume.'; $pause.IsEnabled = $false; $stop.IsEnabled = $false }
+    'stopped' { $dot.Fill = '#D64545'; $title.Text = "Agent stopped · $elapsed"; $action.Text = 'No further desktop input this session. Restart the server to resume.'; $pause.IsEnabled = $false; $stop.Content = 'Close'; $stop.IsEnabled = $true }
     'paused'  {
       $dot.Fill = '#E8A33D'; $pause.Content = 'Resume'; $pause.IsEnabled = $true; $stop.IsEnabled = $true
       if ($null -ne $script:frame -and [string]$script:frame.reason -eq 'takeover') {

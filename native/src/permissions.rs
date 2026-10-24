@@ -85,7 +85,7 @@ mod platform {
 /// process without any error, so a click or keystroke "succeeds" and nothing
 /// happens on screen; naming it is the only way an agent can act on it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const INPUT_UNTRUSTED_REASON: &str = "accessibility_permission_denied: macOS discards synthesized mouse and keyboard events from a process that is not trusted for Accessibility, so this input was not delivered. Enable your terminal, IDE or agent host in System Settings > Privacy & Security > Accessibility, then restart it.";
+pub(crate) const INPUT_UNTRUSTED_REASON: &str = "accessibility_permission_denied: macOS discards synthesized mouse and keyboard events from a process that is not trusted for Accessibility, so this input was not delivered. Enable your terminal, IDE or agent host in System Settings > Privacy & Security > Accessibility (on macOS 27 and later: Device Control and Data Access), then restart it.";
 
 /// Refuse to post input that macOS would silently drop.
 #[cfg(target_os = "macos")]
@@ -154,6 +154,7 @@ mod tests {
     fn untrusted_input_reason_is_nameable_and_actionable() {
         assert!(INPUT_UNTRUSTED_REASON.starts_with("accessibility_permission_denied:"));
         assert!(INPUT_UNTRUSTED_REASON.contains("Privacy & Security > Accessibility"));
+        assert!(INPUT_UNTRUSTED_REASON.contains("Device Control and Data Access"), "the macOS 27 name of the row");
         assert!(INPUT_UNTRUSTED_REASON.contains("not delivered"));
     }
 

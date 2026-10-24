@@ -342,7 +342,7 @@ jobs:
               "dist/launch.js", "dist/env.js", "dist/instructions.js", "dist/entrypoint.js",
               "dist/session/agent-desktop-handlers.js", "dist/session/macos-helper.js", "dist/session/pid-delivery.js",
               "dist/session/user-activity.js", "dist/session/window-select.js", "dist/session/keys.js", "dist/session/input-handlers.js",
-              "libexec/macos-agent-helper.swift", "docs/releases/v7.5.0.md", "docs/releases/v7.6.0.md", "docs/releases/v7.6.1.md",
+              "libexec/macos-agent-helper.swift", "docs/releases/v7.5.0.md", "docs/releases/v7.6.0.md", "docs/releases/v7.6.1.md", "docs/releases/v7.7.0.md",
               "dist/session/input-handlers.js",
               "dist/session/scripting-service.js",
               "dist/session/openai-handler.js",

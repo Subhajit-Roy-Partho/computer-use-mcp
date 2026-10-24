@@ -6,7 +6,7 @@ mod platform {
     #[napi]
     pub fn list_spaces() -> napi::Result<serde_json::Value> {
         // Try wmctrl -d to list desktops
-        let output = std::process::Command::new("wmctrl").args(["-d"]).output();
+        let output = crate::linux_tools::output("wmctrl", &["-d"]);
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
             let mut spaces = Vec::new();
@@ -34,7 +34,7 @@ mod platform {
 
     #[napi]
     pub fn get_active_space() -> napi::Result<serde_json::Value> {
-        let output = std::process::Command::new("wmctrl").args(["-d"]).output();
+        let output = crate::linux_tools::output("wmctrl", &["-d"]);
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
@@ -57,16 +57,10 @@ mod platform {
 
     #[napi]
     pub fn move_window_to_space(window_id: u32, space_id: u32) -> napi::Result<serde_json::Value> {
-        let status = std::process::Command::new("wmctrl")
-            .args([
-                "-i",
-                "-r",
-                &format!("0x{:x}", window_id),
-                "-t",
-                &space_id.to_string(),
-            ])
-            .status();
-        let moved = status.map(|s| s.success()).unwrap_or(false);
+        // 7.7.0 (L1): through linux_tools, so wmctrl never writes to the MCP channel.
+        let moved = crate::linux_tools::output("wmctrl", &["-i", "-r", &format!("0x{:x}", window_id), "-t", &space_id.to_string()])
+            .map(|output| output.status.success())
+            .unwrap_or(false);
         Ok(
             serde_json::json!({ "moved": moved, "reason": if moved { serde_json::Value::Null } else { serde_json::json!("wmctrl failed") } }),
         )

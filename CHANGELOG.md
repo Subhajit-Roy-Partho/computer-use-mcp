@@ -1,18 +1,98 @@
 # Changelog
 
-## v7.6.2 (unreleased)
+## v7.7.0 (unreleased)
 
-Fixes from [the 2026-10-23 competitor study](docs/reviews/2026-10-23-competitor-study.md), in its 7.6.2 order.
+The 7.6.2 and 7.7 work orders from [the 2026-10-23 competitor study](docs/reviews/2026-10-23-competitor-study.md),
+tracked in [`docs/specs/v7.7/tasks.md`](docs/specs/v7.7/tasks.md). 7.6.2 was never released; its fixes ship here.
+
+### Added
+
+- **A result contract on every action.** Each reply says what happened: `effect` (`verified`, `changed`,
+  `no_visible_change` or `unverified`), `route` (`input`, `accessibility`, `window`, `script`, `system`, `clipboard`,
+  `pointer_overlay`, `batch`) and, for input, `delivery` (`hid` or `pid`). Every refusal and every unverified result
+  carries a `hint` (at most 240 characters) and a `next_call` that is always safe to run: a read-only tool this session
+  can call. `verify: true` on the input tools captures before and after and reports `changed` or `no_visible_change`.
+  Activations, `set_value` and clipboard writes are read back and report `verified`.
+- **`run_steps`** (in `desktop`): up to 30 steps in one call. Every step is validated before any runs, the target is
+  focused once, the batch stops at the first failing step and reports the rest as not run, and one capture can follow
+  the last step.
+- **A person's control by default.** The status card is on by default on macOS (`COMPUTER_USE_STATUS_CARD=false` turns
+  it off; Windows stays opt-in). The emergency chord `ctrl+alt+escape` is armed by default on macOS and Windows
+  (`COMPUTER_USE_EMERGENCY_CHORD` changes it or `off` disarms it). When the person moves the mouse deliberately, clicks
+  or types during an action, the agent pauses with `taken_over` and resumes 5 s after they stop
+  (`COMPUTER_USE_TAKEOVER=false` turns this off). A locked screen, a disconnected Remote Desktop session and the
+  Windows secure desktop are refused by name (`screen_locked`, `session_disconnected`, `secure_desktop`). The display
+  is kept awake while an agent works and released after ten quiet minutes (`COMPUTER_USE_KEEP_AWAKE=false`). After
+  Stop, the card's Stop button reads Close: it dismisses the card and the agent stays stopped (the card used to stay on
+  screen, with both buttons disabled, until the server exited).
+- **Windows geometry and capture.** The process is per-monitor DPI aware (v2), so input, window bounds, displays,
+  captures and UI Automation share one physical coordinate space (`COMPUTER_USE_WINDOWS_DPI_AWARENESS=unaware` restores
+  the old behaviour). A window capture tries `PrintWindow` (full content), then Windows.Graphics.Capture, then a crop of
+  the screen flagged when the window is covered, and `BitBlt` last. A minimised window is refused by name. Every
+  monitor can be captured (`screenshot {display_id}`). The reply names the method and the exact screen rectangle.
+- **Faster macOS captures.** Full-screen `screenshot` and `zoom` go through ScreenCaptureKit in the capture helper
+  instead of `screencapture` and `sips`. One helper per server stays running between calls (`serve`; stopped after
+  30 s idle, `COMPUTER_USE_HELPER_SERVE=false` for a process per call). Measured on macOS 26.2: 62 ms per warm capture,
+  112-128 ms per `screenshot` end to end, against 157-223 ms before. `display_id` works on macOS.
+- **Linux backends.** Windows are listed through `swaymsg` on sway, `hyprctl` on Hyprland, GNOME Shell `Eval` where
+  the shell still allows it, and `wmctrl -l -p -G` on X11 and XWayland, with real geometry. `grim -g` captures a window
+  on wlroots compositors, and the XDG desktop portal is the Wayland screenshot of last resort. `doctor` reports
+  `linux_backends`. See [`docs/specs/v7.7/wayland.md`](docs/specs/v7.7/wayland.md) for what is still missing and the
+  libei plan.
+
+### Changed
+
+- The click aliases (`left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`) are listed only in
+  `full`. They remain callable in every profile. The default macOS list is 37 tools and 44,324 bytes (it was 40 and
+  45,942). `full` is 78 tools and 82,698 bytes. Windows lists 33 and 76, Linux 33 and 68. A test now checks the counts
+  in the docs.
+- An unchanged capture returns a short text instead of the same image again; the image is re-sent after three in a row,
+  with `resend: true`, or with `COMPUTER_USE_RESEND_UNCHANGED=true`.
+- `scrape` fetches public addresses only. Every address a name resolves to is checked, and so is each redirect.
+  `COMPUTER_USE_SCRAPE_ALLOW_PRIVATE=true` or `COMPUTER_USE_SCRAPE_ALLOWED_HOSTS` opt back in.
+- Accessibility walks, element searches, menu bars, captures and (on Windows and Linux) activation run on a worker
+  thread, so Stop, cancellation and other requests are answered while they run. Stop from the card lands in
+  milliseconds: the control file is watched, not only polled.
+- Arguments a model sends as text (`"[100, 200]"`, `"100,200"`, `"500"`, `"true"`) are accepted when the original
+  fails its schema and the coerced value passes.
+- `wait_for_text` polls with fast OCR and confirms the final read with accurate OCR; `wait_for_stable` honours
+  `region` (`regionApplied: true`).
+- UI Automation on Windows uses `CUIAutomation8` with a 2 s connection timeout and a 5 s transaction timeout. macOS
+  accessibility walks use a 0.5 s timeout per message and a 5 s budget per walk (`timedOut`, `ax_timeout`).
+- Every Accessibility remediation also names macOS 27's "Device Control and Data Access" row.
 
 ### Fixed
 
+- **Stopped gestures release what they pressed.** Releases bypass the emergency latch; all three mouse buttons are
+  tracked on every platform, and the latch releases every held button and key (Linux released nothing before).
+  `hold_key` validates every key before pressing any and is now press, an awaited timer and release, so Pause, Stop
+  and cancellation reach it at once. F13-F20 work on Windows and Linux.
+- macOS: the last key-up and mouse-up of a chord carry no modifier flags; `type` stopped part-way says how far it got;
+  typing never splits a surrogate pair; the activity tap re-enables itself after the system turns it off; `pbcopy` and
+  `pbpaste` run with a UTF-8 locale.
+- Windows: absolute input is normalised over the virtual desktop; input blocked by UIPI is an `input_blocked` error,
+  not success; newlines in `multi_edit` are typed as Enter; PowerShell output is UTF-8 and decoded across chunks;
+  `prepare_display` minimises only app windows and `unhide_app` restores exactly those; the user-active guard ignores
+  zero-length mouse moves; captures check every GDI result and copy the first duplicated frame before using it.
 - **`process_kill {mode: "list"}` on Windows reads `tasklist`** instead of starting PowerShell for `Get-Process`. A cold
   PowerShell start took over 30 s on the Windows arm64 CI runner, which kept `main` red after #44. The result has the
   same shape (`Id`, `ProcessName`, `MemMB`, largest first, `limit` honoured) and is now always a JSON array.
-- **Release staging skips the native packages when the main version is already on npm.** A push after a release is not
-  a release: the published main version already chose its native dependencies. Before, every later push re-checked
-  them and would have failed on Windows binaries that differ from build to build, and the first push after #44 tried
-  to create the six packages for 7.6.1 with no token.
+- The read-only modes of `filesystem`, `registry` and `process_kill` no longer take the cross-process desktop lock or
+  wait on the person's pause: a search used to fail with `locked_by_pid` while another server typed. Approval policy
+  still applies to the tool.
+- Long text is typed instead of pasted when the clipboard holds an image, a PDF or files, so the paste's save and
+  restore never turns them into empty text. A cancelled screenshot never falls through to a second capture.
+  `run_script` completes 500 ms after the script exits even when a grandchild holds its pipes. `filesystem` search is
+  asynchronous, so cancellation and progress reach it.
+- The agent pointer overlay is left out of every capture (`NSWindowSharingNone`, `WDA_EXCLUDEFROMCAPTURE`).
+- Linux: X11 windows reported 0,0 sized 0x0; a missing `wmctrl`, `xdotool` or capture tool returned empty results and
+  now names the package to install; shell-outs never inherit the MCP stdout; captures honour JPEG quality and no
+  longer read back an empty file after `scrot` wrote beside it; `doctor`'s platform check passed only on macOS and
+  Windows.
+- **Release staging skips the native packages when the main version is already on npm**, tolerates a version already
+  staged and awaiting approval, and warns instead of failing on a published native whose bytes differ (Windows builds
+  are not reproducible). `build:ts` runs `tsc` through Node (no `npx.cmd`), and `npm run build` uses a portable
+  `scripts/build-native.mjs`.
 
 ## v7.6.1 (2026-10-11)
 

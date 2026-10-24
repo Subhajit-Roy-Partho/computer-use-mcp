@@ -5,6 +5,13 @@ import type { SpawnBounded, SpawnResult } from './spawn.js'
 import { utf8Env } from './input-handlers.js'
 import type { LegacyPolicyConfig } from './legacy-policy.js'
 
+/**
+ * 7.7.0 (M6): macOS 27 renamed the Accessibility row in Privacy & Security to "Device Control and Data Access"
+ * (Peekaboo 4.9.4 follows it). Both names are given until the new one is confirmed on a macOS 27 machine.
+ */
+export const ACCESSIBILITY_SETTINGS = 'System Settings > Privacy & Security > Accessibility (on macOS 27 and later: Device Control and Data Access)'
+const ACCESSIBILITY_REMEDIATION = `Open ${ACCESSIBILITY_SETTINGS} and enable your terminal, IDE, or agent host. Restart the host app afterwards.`
+
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip'
 
 export interface DoctorCheck {
@@ -62,6 +69,7 @@ export async function runDoctor(options: {
   const platform = options.platform ?? process.platform
   const isMacos = platform === 'darwin'
   const isWindows = platform === 'win32'
+  const isLinux = platform === 'linux'
   const executeFile = options.execFileSync ?? defaultExecFileSync
   const checks: DoctorCheck[] = []
   const add = (input: DoctorCheck) => {
@@ -73,7 +81,8 @@ export async function runDoctor(options: {
 
   add({
     id: 'platform',
-    status: isMacos || isWindows ? 'pass' : 'fail',
+    // 7.7.0: Linux is supported; it used to fail this check.
+    status: isMacos || isWindows || isLinux ? 'pass' : 'fail',
     summary: `${platform}-${options.arch ?? process.arch} on Node ${options.nodeVersion ?? process.version}`,
     remediation: ['Use macOS, Windows, or Linux on arm64/x64 with Node.js 20+.'],
   })
@@ -164,14 +173,14 @@ export async function runDoctor(options: {
         ...(axTrust ? { accessibilityGranted: axTrust.granted } : {}),
       },
       remediation: isMacos
-        ? ['Open System Settings > Privacy & Security > Accessibility and enable your terminal, IDE, or agent host. Restart the host app afterwards.']
+        ? [ACCESSIBILITY_REMEDIATION]
         : ['UI Automation is built into Windows. If controls are missing, run the agent at the same integrity level as the target app.'],
     })
   } catch (error) {
     add({
       id: isWindows ? 'ui_automation' : 'accessibility', status: 'fail', summary: failure(error),
       remediation: isMacos
-        ? ['Open System Settings > Privacy & Security > Accessibility and enable your terminal, IDE, or agent host. Restart the host app afterwards.']
+        ? [ACCESSIBILITY_REMEDIATION]
         : ['Run the agent from an interactive desktop session and avoid crossing elevated/non-elevated integrity boundaries.'],
     })
   }
@@ -210,6 +219,30 @@ export async function runDoctor(options: {
     }
   } else {
     add({ id: 'powershell', status: 'skip', summary: 'PowerShell is only required for Windows-specific scripting.' })
+  }
+
+  // 7.7.0 (K7): which Linux backends this session uses (window list, capture, input), so a missing one is named.
+  if (isLinux && typeof options.native.getLinuxBackends === 'function') {
+    try {
+      const backends = options.native.getLinuxBackends()
+      const listed = typeof backends.windowList === 'string'
+      const capture = Boolean(backends.screenshot) || backends.screenshotPortal === true
+      const partial = backends.windowList === 'wmctrl-xwayland'
+      add({
+        id: 'linux_backends', status: listed && capture && backends.input && !partial ? 'pass' : 'warn',
+        summary: `${backends.session} (${backends.compositor}): windows via ${listed ? backends.windowList : 'nothing'}, `
+          + `capture via ${backends.screenshot ?? (backends.screenshotPortal ? 'the desktop portal' : 'nothing')}, input via ${backends.input ?? 'nothing'}.`,
+        details: backends,
+        remediation: [
+          ...(!listed ? [`Window listing failed: ${(backends.windowList as { error?: string } | undefined)?.error ?? 'unknown'}.`] : []),
+          ...(partial ? ['GNOME on Wayland lists only XWayland windows to other programs (Shell.Eval is disabled since GNOME 41).'] : []),
+          ...(!capture ? ['Install grim (sway, Hyprland), scrot or ImageMagick (X11), or python3-gi for the desktop portal (GNOME, KDE).'] : []),
+          ...(!backends.input ? [backends.session === 'wayland' ? 'Install ydotool and run ydotoold with access to /dev/uinput.' : 'Install xdotool.'] : []),
+        ],
+      })
+    } catch (error) {
+      add({ id: 'linux_backends', status: 'warn', summary: failure(error) })
+    }
   }
 
   const config = options.policyConfig
@@ -256,7 +289,7 @@ export async function runDoctor(options: {
         add({
           id: 'agent_helper', status: state.helper.ok ? 'pass' : 'warn',
           summary: state.helper.ok
-            ? `Agent helper ready${state.helper.sck ? ' (ScreenCaptureKit window capture + Vision OCR)' : ' (Vision OCR; window capture needs macOS 14)'}.`
+            ? `Agent helper ready${state.helper.sck ? ' (ScreenCaptureKit window and display capture + Vision OCR)' : ' (Vision OCR; capture needs macOS 14)'}.`
             : `Agent helper unavailable: ${state.helper.reason}`,
           details: state.helper.path ? { path: state.helper.path } : undefined,
           remediation: [state.helper.remediation ?? 'Install the Xcode Command Line Tools (xcode-select --install) so swiftc can build the helper.'],

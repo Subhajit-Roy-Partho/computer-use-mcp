@@ -295,6 +295,15 @@ export interface NativeModule {
     detail?: string | null
   }
   holdDisplayAwake?(reason: string): boolean
+  /** 7.7.0 (K7, Linux): the session type, compositor, and the window-list, capture and input backends in use. */
+  getLinuxBackends?(): {
+    session: 'wayland' | 'x11'
+    compositor: string
+    windowList: string | { error: string }
+    screenshot: string | null
+    screenshotPortal: boolean
+    input: string | null
+  }
   releaseDisplayAwake?(): void
 
   // ── v5: Accessibility ──────────────────────────────────────────────────

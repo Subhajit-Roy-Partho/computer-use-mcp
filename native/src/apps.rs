@@ -1,181 +1,89 @@
 // ── Linux implementation ──────────────────────────────────────────────────────
+// 7.7.0 (L1, L2, K7): an app is the set of its windows as `linux_desktop` lists them, so every session type (sway,
+// Hyprland, GNOME, X11) answers the same way, and a missing tool is a named error instead of an empty answer.
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::{linux_desktop, linux_tools};
     use napi_derive::napi;
-    use std::process::Command;
-    use std::sync::OnceLock;
-
-    static IS_WAYLAND: OnceLock<bool> = OnceLock::new();
-
-    fn is_wayland() -> bool {
-        *IS_WAYLAND.get_or_init(|| {
-            std::env::var("XDG_SESSION_TYPE")
-                .map(|v| v == "wayland")
-                .unwrap_or(false)
-        })
-    }
-
-    fn gdbus_eval(js: &str) -> Option<String> {
-        let output = Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.Shell",
-                "--object-path",
-                "/org/gnome/Shell",
-                "--method",
-                "org.gnome.Shell.Eval",
-                js,
-            ])
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout).to_string();
-        if text.starts_with("(true,") {
-            let start = text.find('\'')?;
-            let end = text.rfind('\'')?;
-            if start < end {
-                return Some(text[start + 1..end].replace("\\'", "'"));
-            }
-        }
-        None
-    }
+    use std::time::Duration;
 
     #[napi(js_name = "drainRunloop")]
     pub fn drain_runloop_pub() {}
 
     #[napi]
     pub fn get_frontmost_app() -> napi::Result<serde_json::Value> {
-        if is_wayland() {
-            let js = r#"let w=global.get_window_actors().map(a=>a.meta_window).find(w=>w.has_focus());w?JSON.stringify({bundleId:w.get_wm_class()||'',displayName:w.get_title()||'',pid:w.get_pid()}):'null'"#;
-            if let Some(json_str) = gdbus_eval(js) {
-                if json_str != "null" {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        return Ok(val);
-                    }
-                }
-            }
-        }
-        // X11/fallback
-        let output = Command::new("xdotool")
-            .args(["getactivewindow", "getwindowpid"])
-            .output();
-        let pid = output
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        let name_output = Command::new("xdotool")
-            .args(["getactivewindow", "getwindowname"])
-            .output();
-        let title = name_output
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let proc_name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        Ok(serde_json::json!({ "bundleId": proc_name, "displayName": title, "pid": pid }))
+        let (windows, _) = linux_desktop::list(&None)?;
+        Ok(windows
+            .into_iter()
+            .find(|window| window.focused)
+            .map(|window| serde_json::json!({ "bundleId": window.app, "displayName": window.title, "pid": window.pid }))
+            .unwrap_or(serde_json::Value::Null))
     }
 
     #[napi]
-    pub fn activate_app(
-        bundle_id: String,
-        _timeout_ms: Option<i32>,
-    ) -> napi::Result<serde_json::Value> {
-        if is_wayland() {
-            let js = format!(
-                r#"let w=global.get_window_actors().map(a=>a.meta_window).find(w=>(w.get_wm_class()||'').toLowerCase()==='{cls}'.toLowerCase());if(w){{w.activate(global.get_current_time());'true'}}else{{'false'}}"#,
-                cls = bundle_id.replace('\'', "\\'")
-            );
-            let activated = gdbus_eval(&js).map(|s| s == "true").unwrap_or(false);
-            if activated {
-                return Ok(
-                    serde_json::json!({ "bundleId": bundle_id, "activated": true, "displayName": bundle_id }),
-                );
-            }
-        }
-        // Try wmctrl
-        let status = Command::new("wmctrl")
-            .args(["-x", "-a", &bundle_id])
-            .status();
-        let activated = status.map(|s| s.success()).unwrap_or(false);
-        Ok(
-            serde_json::json!({ "bundleId": bundle_id, "activated": activated, "displayName": bundle_id }),
-        )
+    pub fn activate_app(bundle_id: String, timeout_ms: Option<i32>) -> napi::Result<serde_json::Value> {
+        let (windows, _) = linux_desktop::list(&Some(bundle_id.clone()))?;
+        // The frontmost window of the app first: the one the person used last, when the backend says.
+        let Some(window) = windows.iter().find(|window| window.on_screen).or(windows.first()) else {
+            return Ok(serde_json::json!({ "bundleId": bundle_id, "activated": false, "displayName": bundle_id, "reason": "not_running" }));
+        };
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(2000).clamp(0, 30_000) as u64);
+        let activated = linux_desktop::activate(window.id, timeout)?;
+        Ok(serde_json::json!({ "bundleId": bundle_id, "activated": activated, "displayName": bundle_id }))
     }
 
     #[napi]
     pub fn list_running_apps() -> napi::Result<serde_json::Value> {
-        if is_wayland() {
-            let js = r#"JSON.stringify([...new Set(global.get_window_actors().map(a=>{let w=a.meta_window;return JSON.stringify({bundleId:w.get_wm_class()||'',displayName:w.get_wm_class()||'',pid:w.get_pid(),isHidden:w.minimized})}))].map(s=>JSON.parse(s)))"#;
-            if let Some(json_str) = gdbus_eval(js) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    return Ok(val);
-                }
+        let (windows, _) = linux_desktop::list(&None)?;
+        let mut apps: Vec<serde_json::Value> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for window in windows {
+            if window.app.is_empty() || !seen.insert(window.app.to_lowercase()) {
+                continue;
             }
+            apps.push(serde_json::json!({
+                "bundleId": window.app, "displayName": window.app, "pid": window.pid, "isHidden": !window.on_screen,
+            }));
         }
-        // X11 fallback: list unique processes with windows
-        let output = Command::new("wmctrl")
-            .args(["-l", "-p"])
-            .output()
-            .unwrap_or_else(|_| Command::new("true").output().unwrap());
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut seen = std::collections::HashMap::new();
-        for line in text.lines() {
-            let parts: Vec<&str> = line
-                .splitn(5, char::is_whitespace)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if parts.len() >= 3 {
-                let pid = parts[2].parse::<i32>().unwrap_or(0);
-                let proc_name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                if !proc_name.is_empty() && !seen.contains_key(&proc_name) {
-                    seen.insert(proc_name.clone(), serde_json::json!({
-                        "bundleId": proc_name, "displayName": proc_name, "pid": pid, "isHidden": false,
-                    }));
-                }
-            }
-        }
-        Ok(serde_json::json!(seen.into_values().collect::<Vec<_>>()))
+        Ok(serde_json::json!(apps))
     }
 
     #[napi]
-    pub fn hide_app(bundle_id: String) -> bool {
-        if is_wayland() {
-            let js = format!(
-                r#"global.get_window_actors().map(a=>a.meta_window).filter(w=>(w.get_wm_class()||'').toLowerCase()==='{cls}'.toLowerCase()).forEach(w=>w.minimize());'ok'"#,
-                cls = bundle_id.replace('\'', "\\'")
-            );
-            return gdbus_eval(&js).is_some();
+    pub fn hide_app(bundle_id: String) -> napi::Result<bool> {
+        let (windows, _) = linux_desktop::list(&Some(bundle_id.clone()))?;
+        if windows.is_empty() {
+            return Ok(false);
         }
-        let _ = Command::new("xdotool")
-            .args(["search", "--class", &bundle_id, "windowminimize"])
-            .status();
-        true
+        match linux_desktop::compositor() {
+            "sway" => {
+                for window in &windows {
+                    linux_tools::run("swaymsg", &[&format!("[con_id={}]", window.id), "move", "scratchpad"])?;
+                }
+            }
+            "hyprland" => {
+                for window in &windows {
+                    if let Some(address) = &window.address {
+                        linux_tools::run("hyprctl", &["dispatch", "movetoworkspacesilent", &format!("special:minimized,address:{address}")])?;
+                    }
+                }
+            }
+            _ => {
+                for window in &windows {
+                    linux_tools::run("xdotool", &["windowminimize", &window.id.to_string()])?;
+                }
+            }
+        }
+        Ok(true)
     }
 
     #[napi]
-    pub fn unhide_app(bundle_id: String) -> bool {
-        if is_wayland() {
-            let js = format!(
-                r#"let w=global.get_window_actors().map(a=>a.meta_window).find(w=>(w.get_wm_class()||'').toLowerCase()==='{cls}'.toLowerCase());if(w){{w.unminimize();w.activate(global.get_current_time());'true'}}else{{'false'}}"#,
-                cls = bundle_id.replace('\'', "\\'")
-            );
-            return gdbus_eval(&js).map(|s| s == "true").unwrap_or(false);
+    pub fn unhide_app(bundle_id: String) -> napi::Result<bool> {
+        let (windows, _) = linux_desktop::list(&Some(bundle_id))?;
+        let Some(window) = windows.first() else { return Ok(false) };
+        if linux_desktop::compositor() == "sway" && !window.on_screen {
+            linux_tools::run("swaymsg", &[&format!("[con_id={}]", window.id), "scratchpad", "show"])?;
         }
-        let status = Command::new("wmctrl")
-            .args(["-x", "-a", &bundle_id])
-            .status();
-        status.map(|s| s.success()).unwrap_or(false)
+        linux_desktop::activate(window.id, Duration::from_millis(2000))
     }
 }
 
