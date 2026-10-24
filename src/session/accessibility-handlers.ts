@@ -219,6 +219,16 @@ export async function handleAccessibilityTool(
         // 7.6.1: the fallback used to post a real click straight to the native layer, past the user-active guard
         // and coordinate validation. It now goes through the same path as `click`.
         if (!context.input) return errJson({ error: 'input_unavailable', tool, message: 'AXPress is unsupported here and no input handler is configured for the coordinate fallback.' })
+        // focus_strategy "none" promises no focus steal and no cursor motion. The
+        // coordinate fallback is a HID click, so it would break that promise;
+        // delivery "pid" stays safe because clickAt posts to the process.
+        if (context.focus.strategyFor('click_element', args) === 'none' && args.delivery !== 'pid') {
+          return errJson({
+            error: 'focus_strategy_none_no_hid', tool, focus_strategy: 'none',
+            message: 'focus_strategy "none" skips the HID coordinate fallback (it would move the cursor and click the frontmost app).',
+            remediation: ['Pass delivery "pid" so the fallback posts to the target process without focus or cursor motion.'],
+          })
+        }
         const x = Math.round(result.bounds.x + result.bounds.width / 2)
         const y = Math.round(result.bounds.y + result.bounds.height / 2)
         const clicked = await context.input.clickAt({ x, y }, 'left', 1, 'click_element', { ...args, target_window_id: target.windowId })

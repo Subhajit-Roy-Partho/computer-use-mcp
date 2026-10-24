@@ -172,12 +172,36 @@ test('read_window_text returns lines with window boxes plus screen_origin and ho
 
 test('click_text clicks the centre of the matched text and reports what it matched', async () => {
   const d = desktop()
-  const result = await handleAgentDesktopTool('click_text', { text: 'Build', target_app: 'com.epicgames.UnrealEditor', focus_strategy: 'none' }, d.context)
+  const result = await handleAgentDesktopTool('click_text', { text: 'Build', target_app: 'com.epicgames.UnrealEditor' }, d.context)
   assert.equal(result.structuredContent.clicked.matched, 'Build')
   assert.deepEqual(d.calls.find(c => c[0] === 'click'), ['click', 925, 43, 'left', 1])
   const miss = await handleAgentDesktopTool('click_text', { text: 'Play', target_app: 'com.epicgames.UnrealEditor' }, d.context)
   assert.equal(miss.structuredContent.error, 'text_not_found')
   assert.ok(miss.structuredContent.seen.includes('Build'))
+})
+
+test('click_text with focus_strategy none refuses HID but allows delivery pid', async () => {
+  const d = desktop()
+  await assert.rejects(
+    handleAgentDesktopTool('click_text', { text: 'Build', target_app: 'com.epicgames.UnrealEditor', focus_strategy: 'none' }, d.context),
+    error => error.details?.error === 'focus_strategy_none_no_hid',
+  )
+  assert.equal(d.calls.some(c => c[0] === 'click' || c[0] === 'move'), false, 'no cursor motion was posted')
+  const pid = await handleAgentDesktopTool('click_text', {
+    text: 'Build', target_app: 'com.epicgames.UnrealEditor', focus_strategy: 'none', delivery: 'pid',
+  }, d.context)
+  assert.match(pid.structuredContent.result, /delivery: pid/)
+  assert.deepEqual(d.calls.find(c => c[0] === 'clickToPid'), ['clickToPid', 4242, 925, 43, 'left', 1, 7])
+})
+
+test('click_element is on the pid-delivery surface', async () => {
+  const { PID_DELIVERY_TOOLS } = await import('../dist/session/input-handlers.js')
+  assert.ok(PID_DELIVERY_TOOLS.has('click_element'))
+  const { inputClassFor } = await import('../dist/session/pid-delivery.js')
+  assert.equal(inputClassFor('click_element'), 'pointer')
+  const d = desktop()
+  await d.input.handle('left_click', { coordinate: [300, 300], target_app: 'com.epicgames.UnrealEditor', delivery: 'pid' })
+  assert.ok(d.calls.some(c => c[0] === 'clickToPid'), 'pointer pid delivery still works')
 })
 
 test('click_text with delivery pid posts to the process at screen coordinates without activating', async () => {

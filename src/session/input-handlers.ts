@@ -55,6 +55,7 @@ function pidEffect(outcome: PidOutcome | undefined): Effect {
 /** v7.5 (R5): tools whose input can be posted to the target process instead. */
 export const PID_DELIVERY_TOOLS = new Set([
   'click', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'scroll', 'type', 'key',
+  'click_element',
 ])
 
 /**
@@ -158,7 +159,7 @@ export class InputHandler {
       if (!pidTool) {
         throw new StructuredToolError(`${tool} has no pid delivery`, {
           error: 'pid_delivery_unsupported', tool,
-          remediation: ['Pid delivery covers key, type, the click tools, scroll and click_text.'],
+          remediation: ['Pid delivery covers key, type, the click tools, scroll, click_text and click_element.'],
         })
       }
       return this.#pidRoute(tool, args, 'requested')
@@ -310,7 +311,20 @@ export class InputHandler {
       return { ...ok(`Clicked (${Math.round(x)}, ${Math.round(y)})${this.#pidNote(chosen, outcome)}`),
         contract: { delivery: 'pid', effect: pidEffect(outcome) } }
     }
-    await this.#focus.ensure(resolved, this.#focus.strategyFor(tool, args), { tool, force: true })
+    // focus_strategy "none" promises no activation and no cursor motion. The HID
+    // path moves the real cursor and posts to the frontmost app, so allowing it
+    // here would silently click wherever the cursor happens to be.
+    const strategy = this.#focus.strategyFor(tool, args)
+    if (strategy === 'none') {
+      throw new StructuredToolError('focus_strategy "none" needs delivery "pid" for a click', {
+        error: 'focus_strategy_none_no_hid', tool,
+        focus_strategy: strategy, delivery: 'hid',
+        remediation: [
+          'Pass delivery "pid" (macOS: posts to the target process without focus or cursor motion), or omit focus_strategy "none" to allow the HID click.',
+        ],
+      })
+    }
+    await this.#focus.ensure(resolved, strategy, { tool, force: true })
     const { x, y } = point
     this.#validateCoordinates(x, y)
     this.#native.mouseMove(x, y)

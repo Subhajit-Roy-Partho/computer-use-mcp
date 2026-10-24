@@ -26,7 +26,7 @@ function fixture({ platform = 'linux', sleep, execFile } = {}) {
   }
   const targets = new TargetStateController(native, () => 100)
   const focus = {
-    strategyFor: () => 'none',
+    strategyFor: (_tool, args) => args?.focus_strategy ?? 'best_effort',
     ensure: async () => ({}),
   }
   const handler = new InputHandler({
@@ -303,4 +303,54 @@ test('long text is typed, not pasted, when the clipboard holds an image or files
   assert.deepEqual(f.native.calls, [['type', 'line one\nline two']], 'no clipboard write, no paste')
   assert.match(result.content[0].text, /typed rather than pasted, to keep them/)
   assert.equal(f.clipboard(), 'original')
+})
+
+// ── focus_strategy "none" never moves the real cursor ───────────────────────
+// A HID click posts to the frontmost app and moves the cursor, so "no focus"
+// plus "HID delivery" is a contradiction: refuse instead of clicking wherever
+// the cursor happens to be. delivery "pid" stays safe (posts to the process).
+
+test('clickAt with focus_strategy none and HID delivery throws instead of clicking', async () => {
+  const { PID_DELIVERY_TOOLS } = await import('../dist/session/input-handlers.js')
+  assert.ok(PID_DELIVERY_TOOLS.has('click_element'), 'click_element is on the pid-delivery surface')
+  const f = fixture()
+  await assert.rejects(
+    f.handler.handle('left_click', { coordinate: [25, 30], focus_strategy: 'none' }),
+    error => {
+      assert.equal(error.details?.error, 'focus_strategy_none_no_hid')
+      assert.match(error.message, /focus_strategy "none"/)
+      return true
+    },
+  )
+  assert.deepEqual(f.native.calls, [], 'no cursor motion and no click were posted')
+})
+
+test('clickAt with focus_strategy none and delivery pid posts to the process', async () => {
+  const calls = []
+  const native = {
+    getDisplaySize: () => ({ width: 500, height: 400 }),
+    listDisplays: () => [{ x: 0, y: 0, width: 500, height: 400 }],
+    getWindow: id => id === 9 ? { windowId: 9, pid: 4242, bundleId: 'app.fixture', bounds: { x: 100, y: 50, width: 200, height: 200 } } : null,
+    listRunningApps: () => [{ bundleId: 'app.fixture', pid: 4242 }],
+    getFrontmostApp: () => ({ bundleId: 'app.other' }),
+    mouseClickToPid: (...args) => calls.push(['clickToPid', ...args]),
+    keyPressToPid: (...args) => calls.push(['keyToPid', ...args]),
+    typeTextToPid: (...args) => calls.push(['typeToPid', ...args]),
+    mouseMove: (...args) => calls.push(['move', ...args]),
+    mouseClick: (...args) => calls.push(['click', ...args]),
+  }
+  const { TargetStateController } = await import('../dist/session/target-state.js')
+  const targets = new TargetStateController(native, () => 100)
+  const { InputHandler } = await import('../dist/session/input-handlers.js')
+  const handler = new InputHandler({
+    native, targets,
+    focus: { strategyFor: (_tool, args) => args?.focus_strategy ?? 'best_effort', ensure: async () => ({}) },
+    platform: 'darwin', sleep: async () => {},
+  })
+  const result = await handler.handle('left_click', {
+    coordinate: [10, 20], target_window_id: 9, focus_strategy: 'none', delivery: 'pid',
+  })
+  assert.match(result.content[0].text, /delivery: pid/)
+  assert.deepEqual(calls.find(c => c[0] === 'clickToPid'), ['clickToPid', 4242, 110, 70, 'left', 1, 9])
+  assert.equal(calls.some(c => c[0] === 'move' || c[0] === 'click'), false, 'no HID cursor motion')
 })
