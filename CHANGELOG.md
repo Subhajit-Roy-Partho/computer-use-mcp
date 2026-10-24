@@ -1,5 +1,19 @@
 # Changelog
 
+## v7.6.2 (unreleased)
+
+Fixes from [the 2026-10-23 competitor study](docs/reviews/2026-10-23-competitor-study.md), in its 7.6.2 order.
+
+### Fixed
+
+- **`process_kill {mode: "list"}` on Windows reads `tasklist`** instead of starting PowerShell for `Get-Process`. A cold
+  PowerShell start took over 30 s on the Windows arm64 CI runner, which kept `main` red after #44. The result has the
+  same shape (`Id`, `ProcessName`, `MemMB`, largest first, `limit` honoured) and is now always a JSON array.
+- **Release staging skips the native packages when the main version is already on npm.** A push after a release is not
+  a release: the published main version already chose its native dependencies. Before, every later push re-checked
+  them and would have failed on Windows binaries that differ from build to build, and the first push after #44 tried
+  to create the six packages for 7.6.1 with no token.
+
 ## v7.6.1 (2026-10-11)
 
 The 7.6.1 list from [the 2026-10-11 review](docs/reviews/2026-10-11-end-to-end-review.md) §7, tracked in

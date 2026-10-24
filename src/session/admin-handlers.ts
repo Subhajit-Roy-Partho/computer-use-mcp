@@ -23,6 +23,21 @@ function requiredString(args: Record<string, unknown>, key: string): string {
   return args[key]
 }
 
+/**
+ * `tasklist /FO CSV /NH` rows: "Image Name","PID","Session Name","Session#","Mem Usage". The memory column is localised
+ * ("12,345 K", "12.345 K", "12 345 K"), so only its digits are read. Names lose `.exe`, as Get-Process reported them.
+ */
+export function parseTasklistCsv(stdout: string): { Id: number; ProcessName: string; MemMB: number }[] {
+  const processes: { Id: number; ProcessName: string; MemMB: number }[] = []
+  for (const line of stdout.split(/\r?\n/)) {
+    const fields = [...line.matchAll(/"((?:[^"]|"")*)"/g)].map(match => match[1].replace(/""/g, '"'))
+    if (fields.length < 5 || !/^\d+$/.test(fields[1])) continue
+    const kilobytes = Number(fields[4].replace(/\D/g, ''))
+    processes.push({ Id: Number(fields[1]), ProcessName: fields[0].replace(/\.exe$/i, ''), MemMB: Math.round(kilobytes / 1024 * 10) / 10 })
+  }
+  return processes
+}
+
 function powershellLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
 }
@@ -215,17 +230,19 @@ export async function handleAdminTool(
     const mode = requiredString(args, 'mode')
     if (mode === 'list') {
       if (isWindows) {
-        // Get-Process on a cold machine can take over 10 s (seen on the CI runner), and a timeout used to come back
-        // as an empty error text. Give it 30 s and say what happened.
+        // 7.6.2: tasklist instead of `powershell Get-Process`. Starting PowerShell cold took over 30 s on the arm64 CI
+        // runner (runs 38337539541 and 38345976977); tasklist is a plain executable. Same JSON shape as before.
         const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : 20
-        const timeoutMs = 30_000
-        const result = await context.spawnBounded('powershell', ['-NoProfile', '-Command',
-          `Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First ${limit} Id,ProcessName,@{N="MemMB";E={[math]::Round($_.WorkingSet64/1MB,1)}} | ConvertTo-Json`], timeoutMs)
-        if (result.code === 0) return ok(result.stdout)
+        const timeoutMs = 15_000
+        const result = await context.spawnBounded('tasklist', ['/FO', 'CSV', '/NH'], timeoutMs)
         if (result.timedOut) {
-          return errJson({ error: 'timeout', message: `powershell Get-Process did not answer within ${timeoutMs} ms`, hint: 'Retry; a machine under load can take a while to enumerate processes.' })
+          return errJson({ error: 'timeout', message: `tasklist did not answer within ${timeoutMs} ms`, hint: 'Retry; a machine under load can take a while to enumerate processes.' })
         }
-        return errJson({ error: 'process_list_failed', message: result.stderr.trim() || `powershell exited with ${result.code}` })
+        if (result.code !== 0) {
+          return errJson({ error: 'process_list_failed', message: result.stderr.trim() || `tasklist exited with ${result.code}` })
+        }
+        const processes = parseTasklistCsv(result.stdout).sort((a, b) => b.MemMB - a.MemMB).slice(0, limit)
+        return ok(JSON.stringify(processes, null, 2))
       }
       const result = await context.spawnBounded('ps', isLinux ? ['aux', '--sort=-%mem'] : ['aux', '-r'], 5_000)
       return ok(result.stdout.split('\n').slice(0, 21).join('\n'))

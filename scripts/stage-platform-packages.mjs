@@ -20,14 +20,14 @@ function errorCode(result) {
 }
 
 export function stagePlatformPackages(directory = root, npm = runNpm) {
-  const version = readJson(join(directory, 'package.json')).version
+  const rootPkg = readJson(join(directory, 'package.json'))
+  const version = rootPkg.version
   const packages = readJson(join(directory, 'release', 'platform', 'packages.json'))
   if (packages.length !== TARGETS.length || new Set(packages.map(pkg => pkg.target)).size !== TARGETS.length) {
     throw new Error('Release must contain all six distinct native packages')
   }
   // Complete local and registry preflight before staging any package.
-  const pending = []
-  for (const pkg of packages) {
+  const local = packages.map(pkg => {
     if (!TARGETS.includes(pkg.target) || pkg.version !== version ||
         pkg.name !== `@zavora-ai/computer-use-mcp-${pkg.target}` ||
         pkg.filename !== `zavora-ai-computer-use-mcp-${pkg.target}-${version}.tgz`) {
@@ -36,6 +36,21 @@ export function stagePlatformPackages(directory = root, npm = runNpm) {
     const archive = join(directory, 'release', 'platform', pkg.filename)
     const integrity = 'sha512-' + createHash('sha512').update(readFileSync(archive)).digest('base64')
     if (integrity !== pkg.integrity) throw new Error(`Tarball integrity mismatch: ${pkg.name}`)
+    return { pkg, archive, integrity }
+  })
+  // 7.6.2: a push after a release is not a release. The main version already on npm already chose its native
+  // dependencies, so nothing is staged; without this, every later push re-checked (and, with non-reproducible Windows
+  // builds, failed on) packages that cannot change, and a version from before the native packages existed tried to
+  // create them.
+  const mainSpec = `${rootPkg.name ?? '@zavora-ai/computer-use-mcp'}@${version}`
+  const main = npm(['view', mainSpec, 'version', '--json'])
+  if (main.status === 0 && main.stdout.trim()) {
+    console.log(`${mainSpec} is already published; no native packages to stage`)
+    return
+  }
+  if (main.status !== 0 && errorCode(main) !== 'E404') throw new Error(`Cannot check ${mainSpec}: ${main.stderr || main.stdout}`)
+  const pending = []
+  for (const { pkg, archive, integrity } of local) {
     const spec = `${pkg.name}@${version}`
     const existing = npm(['view', spec, 'dist.integrity', '--json'])
     if (existing.status === 0) {
