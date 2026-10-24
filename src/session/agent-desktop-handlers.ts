@@ -22,6 +22,8 @@ export const AGENT_DESKTOP_TOOLS = new Set(['read_window_text', 'click_text', 'w
 export const WAIT_FOR_WINDOW_POLL_MS = 250
 export const WAIT_FOR_TEXT_POLL_MS = 500
 export const WAIT_FOR_TEXT_MIN_POLL_MS = 200
+/** Every this many polls wait_for_text reads with accurate OCR, for text that fast recognition never reads (K8). */
+export const WAIT_FOR_TEXT_ACCURATE_EVERY = 3
 export const WAIT_FOR_STABLE_POLL_MS = 250
 export const WAIT_FOR_STABLE_MIN_POLL_MS = 50
 export const WAIT_FOR_STABLE_QUIET_MS = 800
@@ -187,6 +189,7 @@ async function ocrWindow(
   tool: string,
   args: Record<string, unknown>,
   context: AgentDesktopContext,
+  fast: boolean = args.fast === true,
 ): Promise<{ window: WindowRecord; lines: TextLine[]; ocrMs?: number } | ToolResult> {
   const blocked = preflight(tool, context)
   if (blocked) return blocked
@@ -195,7 +198,7 @@ async function ocrWindow(
   const languages = Array.isArray(args.languages) ? (args.languages as unknown[]).filter((v): v is string => typeof v === 'string') : undefined
   let ocr: HelperOcr
   try {
-    ocr = await context.helper!.ocr({ windowId: window.windowId, region, languages, fast: args.fast === true }, context.signal)
+    ocr = await context.helper!.ocr({ windowId: window.windowId, region, languages, fast }, context.signal)
   } catch (error) {
     return helperFailureResult(tool, error)
   }
@@ -240,40 +243,62 @@ async function waitForText(args: Record<string, unknown>, context: AgentDesktopC
   const pollMs = clampMs(args.poll_ms, WAIT_FOR_TEXT_POLL_MS, WAIT_FOR_TEXT_MIN_POLL_MS, WAIT_MAX_TIMEOUT_MS)
   const now = context.now ?? Date.now
   const started = now()
+  // 7.7.0 (K8): polls read with fast OCR, about half the time of accurate, and a poll that would end the wait is read
+  // again with accurate OCR before it counts: fast recognition misses 18-30% of lines, so on its own it would report
+  // text gone that is still there. Every third poll, and the last before the timeout, is accurate, so text fast
+  // recognition never reads is still found. fast: true reads fast throughout; fast: false reads accurate throughout,
+  // as before 7.7.
+  const recognition = args.fast === true ? 'fast' : args.fast === false ? 'accurate' : 'mixed'
+  const reads = { fast: 0, accurate: 0 }
   let polls = 0
   let lastWindow: WindowRecord | undefined
+  const windowGone = () =>
+    okJson({ gone: true, waitedMs: now() - started, polls, reads, window: lastWindow ? windowSummary(lastWindow) : null, windowGone: true })
+  // One OCR read; undefined when the window went while waiting for the text to go (a window that is gone has no text).
+  const read = async (fast: boolean): Promise<Awaited<ReturnType<typeof ocrWindow>> | undefined> => {
+    try {
+      const result = await ocrWindow('wait_for_text', args, context, fast)
+      reads[fast ? 'fast' : 'accurate']++
+      return result
+    } catch (error) {
+      if (gone && error instanceof StructuredToolError && error.details?.error === 'window_not_found') return undefined
+      throw error
+    }
+  }
+  const ends = (matches: number) => gone ? matches === 0 : matches > 0
   for (;;) {
     const pollStarted = now()
     polls++
-    let result: Awaited<ReturnType<typeof ocrWindow>>
-    try {
-      result = await ocrWindow('wait_for_text', args, context)
-    } catch (error) {
-      // Waiting for the text to go: a window that is gone has no text either.
-      if (gone && error instanceof StructuredToolError && error.details?.error === 'window_not_found') {
-        return okJson({ gone: true, waitedMs: now() - started, polls, window: lastWindow ? windowSummary(lastWindow) : null, windowGone: true })
-      }
-      throw error
-    }
+    const lastPoll = pollStarted - started + pollMs >= timeoutMs
+    const accurateTurn = recognition === 'accurate' || (recognition === 'mixed' && (lastPoll || polls % WAIT_FOR_TEXT_ACCURATE_EVERY === 0))
+    let result = await read(recognition === 'fast' || !accurateTurn)
+    if (!result) return windowGone()
     if ('content' in result) return result
     lastWindow = result.window
+    let matches = findText(result.lines, text, mode, screenOrigin(result.window))
+    if (ends(matches.length) && recognition === 'mixed' && !accurateTurn) {
+      result = await read(false)
+      if (!result) return windowGone()
+      if ('content' in result) return result
+      lastWindow = result.window
+      matches = findText(result.lines, text, mode, screenOrigin(result.window))
+    }
     const seen = result.lines.map(line => line.text)
-    const matches = findText(result.lines, text, mode, screenOrigin(result.window))
     const waitedMs = now() - started
     if (!gone && matches.length > 0) {
       const first = matches[0]
       return okJson({
-        found: true, waitedMs, polls,
+        found: true, waitedMs, polls, reads,
         match: { text: first.line.text, matched: first.matched, confidence: first.line.confidence, box: first.line.box, screen: first.point },
         matches: matches.length,
         window: windowSummary(result.window),
         screen_origin: screenOrigin(result.window),
       })
     }
-    if (gone && matches.length === 0) return okJson({ gone: true, waitedMs, polls, window: windowSummary(result.window) })
+    if (gone && matches.length === 0) return okJson({ gone: true, waitedMs, polls, reads, window: windowSummary(result.window) })
     if (waitedMs >= timeoutMs) {
       return errJson({
-        error: 'timeout', waitedMs, polls, text, match: mode, gone,
+        error: 'timeout', waitedMs, polls, reads, text, match: mode, gone,
         window: windowSummary(result.window),
         // What the last poll read, so the caller can see how the text was read instead.
         seen: seen.slice(0, 20), ...(seen.length > 20 ? { seenTruncated: seen.length - 20 } : {}),

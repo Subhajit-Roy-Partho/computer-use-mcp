@@ -43,7 +43,7 @@ function helperFixture(responses = {}) {
 
 test('the helper compiles once into a sha-named cache file, signs it, then reuses it', async () => {
   const f = helperFixture()
-  const helper = createMacosHelper({ sourcePath: f.source, cacheDir: f.dir, platform: 'darwin', darwinRelease: '25.2.0', run: f.run })
+  const helper = createMacosHelper({ sourcePath: f.source, cacheDir: f.dir, platform: 'darwin', darwinRelease: '25.2.0', run: f.run, serve: false })
   const first = await helper.ensure()
   assert.equal(first.ok, true)
   assert.match(first.path, /macos-agent-helper-[0-9a-f]{8}$/)

@@ -384,7 +384,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
   }, NONE_READ)
 
   // v7.6 R3: waits that replace sleep-and-screenshot loops (macOS: OCR and ScreenCaptureKit)
-  tool('wait_for_text', 'macOS. Wait until text appears in a window (or, with gone: true, disappears), polling the on-device OCR (default every 500 ms, minimum 200). Returns the matched line with its box in window points and its screen point, as soon as it matches; on timeout an error listing the last lines read. Does not activate the app or move the cursor. Use instead of sleeping and taking screenshots.', {
+  tool('wait_for_text', 'macOS. Wait until text appears in a window (or, with gone: true, disappears), polling the on-device OCR (default every 500 ms, minimum 200; fast recognition, confirmed with accurate before it returns). Returns the matched line with its box in window points and its screen point, as soon as it matches; on timeout an error listing the last lines read. Does not activate the app or move the cursor. Use instead of sleeping and taking screenshots.', {
     text: z.string().min(1).describe('Text to wait for'),
     match: z.enum(['exact', 'contains', 'regex']).optional().default('contains').describe('exact: the whole line; contains: a case-insensitive substring; regex: a case-insensitive JavaScript regular expression'),
     gone: z.boolean().optional().default(false).describe('Wait for the text to disappear instead'),

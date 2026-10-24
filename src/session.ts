@@ -225,6 +225,7 @@ export function createSession(opts: SessionOptions = {}): Session {
       // 7.6.1: apps hidden by prepare_display that the agent never restored come back when the session ends.
       try { focus.restoreHidden() } catch { /* best effort */ }
       try { control.close() } catch { /* the card is optional */ }
+      try { macosHelper?.close?.() } catch { /* the warm helper exits with this process anyway */ }
       if (awakeTimer) clearTimeout(awakeTimer)
       try { n.releaseDisplayAwake?.() } catch { /* best effort */ }
     }

@@ -256,7 +256,7 @@ export async function runDoctor(options: {
         add({
           id: 'agent_helper', status: state.helper.ok ? 'pass' : 'warn',
           summary: state.helper.ok
-            ? `Agent helper ready${state.helper.sck ? ' (ScreenCaptureKit window capture + Vision OCR)' : ' (Vision OCR; window capture needs macOS 14)'}.`
+            ? `Agent helper ready${state.helper.sck ? ' (ScreenCaptureKit window and display capture + Vision OCR)' : ' (Vision OCR; capture needs macOS 14)'}.`
             : `Agent helper unavailable: ${state.helper.reason}`,
           details: state.helper.path ? { path: state.helper.path } : undefined,
           remediation: [state.helper.remediation ?? 'Install the Xcode Command Line Tools (xcode-select --install) so swiftc can build the helper.'],
