@@ -1,4 +1,4 @@
-import { withToolDefaults } from './registry/definitions.js'
+import { coerceArguments, withToolDefaults } from './registry/definitions.js'
 /**
  * Session — resilient computer use session with in-process focus management.
  *
@@ -404,7 +404,7 @@ export function createSession(opts: SessionOptions = {}): Session {
     requestContext?: SessionRequestContext,
   ): Promise<ToolResult> {
 
-    args = withToolDefaults(tool, args)
+    args = withToolDefaults(tool, coerceArguments(tool, args))
 
     // v5.2: Only mutating tools take the session lock and start the pump.
     // Observation tools stay concurrent and cheap.

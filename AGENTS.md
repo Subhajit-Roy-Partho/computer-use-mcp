@@ -234,7 +234,8 @@ checkout's `dist/server.js` to run a source build.
 
 **Cursor is the host process on macOS.** Cursor spawns the server, so macOS
 attributes every permission to Cursor — not to `node`, `npx` or your terminal.
-Enable **Cursor** in System Settings › Privacy & Security › **Accessibility** and
+Enable **Cursor** in System Settings › Privacy & Security › **Accessibility** (on macOS 27 and later
+**Device Control and Data Access**) and
 **Screen & System Audio Recording**, allow it under **Automation** when
 `run_script` first targets an app, then restart Cursor. Without Accessibility,
 input tools refuse with `accessibility_permission_denied` rather than silently

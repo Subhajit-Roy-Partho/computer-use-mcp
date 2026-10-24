@@ -26,6 +26,7 @@ import {
   type ToolMeta,
 } from '../tool-catalog.js'
 import { PRIORITY_OUTPUT_SCHEMAS } from '../output-schemas.js'
+import { coerceToShape } from './coerce.js'
 import { toMcpToolResult, type ToolResult } from '../result.js'
 
 export type ToolHandler = (
@@ -322,7 +323,7 @@ export class ToolRegistry {
         }),
       }
     }
-    const validated = z.object(definition.inputSchema).passthrough().safeParse(args ?? {})
+    const validated = z.object(definition.inputSchema).passthrough().safeParse(coerceToShape(definition.inputSchema, args ?? {}))
     if (!validated.success) {
       return {
         ok: false,
@@ -407,7 +408,7 @@ export class ToolRegistry {
           // so handlers never have to restate a schema default. Malformed input
           // becomes a recoverable tool result rather than a JSON-RPC fault: an
           // agent can read `issues` and retry, but cannot retry a thrown error.
-          const validated = z.object(inputSchema).passthrough().safeParse(args)
+          const validated = z.object(inputSchema).passthrough().safeParse(coerceToShape(inputSchema, args))
           if (!validated.success) {
             return {
               content: [{ type: 'text', text: JSON.stringify({

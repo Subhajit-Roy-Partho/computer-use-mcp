@@ -5,6 +5,13 @@ import type { SpawnBounded, SpawnResult } from './spawn.js'
 import { utf8Env } from './input-handlers.js'
 import type { LegacyPolicyConfig } from './legacy-policy.js'
 
+/**
+ * 7.7.0 (M6): macOS 27 renamed the Accessibility row in Privacy & Security to "Device Control and Data Access"
+ * (Peekaboo 4.9.4 follows it). Both names are given until the new one is confirmed on a macOS 27 machine.
+ */
+export const ACCESSIBILITY_SETTINGS = 'System Settings > Privacy & Security > Accessibility (on macOS 27 and later: Device Control and Data Access)'
+const ACCESSIBILITY_REMEDIATION = `Open ${ACCESSIBILITY_SETTINGS} and enable your terminal, IDE, or agent host. Restart the host app afterwards.`
+
 export type DoctorStatus = 'pass' | 'warn' | 'fail' | 'skip'
 
 export interface DoctorCheck {
@@ -164,14 +171,14 @@ export async function runDoctor(options: {
         ...(axTrust ? { accessibilityGranted: axTrust.granted } : {}),
       },
       remediation: isMacos
-        ? ['Open System Settings > Privacy & Security > Accessibility and enable your terminal, IDE, or agent host. Restart the host app afterwards.']
+        ? [ACCESSIBILITY_REMEDIATION]
         : ['UI Automation is built into Windows. If controls are missing, run the agent at the same integrity level as the target app.'],
     })
   } catch (error) {
     add({
       id: isWindows ? 'ui_automation' : 'accessibility', status: 'fail', summary: failure(error),
       remediation: isMacos
-        ? ['Open System Settings > Privacy & Security > Accessibility and enable your terminal, IDE, or agent host. Restart the host app afterwards.']
+        ? [ACCESSIBILITY_REMEDIATION]
         : ['Run the agent from an interactive desktop session and avoid crossing elevated/non-elevated integrity boundaries.'],
     })
   }
