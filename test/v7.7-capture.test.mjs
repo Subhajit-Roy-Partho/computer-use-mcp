@@ -348,3 +348,10 @@ test('wait_for_stable reports regionApplied: true when the helper cropped to the
   assert.equal(result.structuredContent.regionApplied, true)
   assert.deepEqual(captures[0].region, { x: 10, y: 20, width: 300, height: 200 })
 })
+
+// 7.7.0 (M6): macOS 27 renamed the Accessibility row; every remediation names both.
+test('the Accessibility remediation names the macOS 27 row as well', async () => {
+  const { ACCESSIBILITY_SETTINGS } = await import('../dist/session/doctor.js')
+  assert.match(ACCESSIBILITY_SETTINGS, /Privacy & Security > Accessibility/)
+  assert.match(ACCESSIBILITY_SETTINGS, /Device Control and Data Access/)
+})

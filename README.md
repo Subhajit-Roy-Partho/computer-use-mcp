@@ -121,7 +121,7 @@ Before using desktop tools:
 
 | Platform | Setup |
 |---|---|
-| macOS 14+ | Grant the host app Accessibility and Screen Recording access. The host is the app that launches the server (your terminal, Cursor or Claude Desktop), not `node`. Input Monitoring lets the user-active guard see when you are typing or moving the mouse. App scripting may also request Automation access. Until Accessibility is granted, input tools refuse with `accessibility_permission_denied` rather than silently doing nothing. |
+| macOS 14+ | Grant the host app Accessibility (called Device Control and Data Access from macOS 27) and Screen Recording access. The host is the app that launches the server (your terminal, Cursor or Claude Desktop), not `node`. Input Monitoring lets the user-active guard see when you are typing or moving the mouse. App scripting may also request Automation access. Until Accessibility is granted, input tools refuse with `accessibility_permission_denied` rather than silently doing nothing. |
 | Windows | Run in a signed-in desktop session. Protected or elevated windows may need matching privileges. |
 | Linux | Use a graphical session with the required X11/Wayland utilities. Accessibility support needs AT-SPI. See [platform details](docs/ARCHITECTURE.md). |
 

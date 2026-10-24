@@ -94,7 +94,7 @@ const K_AX_VALUE_CG_SIZE_TYPE: u32 = 2;
 fn ax_error_to_reason(err: AXError) -> String {
     match err {
         K_AX_ERROR_NOT_AUTHORIZED | K_AX_ERROR_API_DISABLED => {
-            "accessibility_permission_denied: Grant Accessibility permission in System Settings > Privacy & Security > Accessibility".to_string()
+            "accessibility_permission_denied: Grant Accessibility permission in System Settings > Privacy & Security > Accessibility (on macOS 27 and later: Device Control and Data Access)".to_string()
         }
         _ => format!("ax_error:{err}"),
     }

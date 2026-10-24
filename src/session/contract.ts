@@ -231,7 +231,7 @@ export const REFUSALS: Readonly<Record<string, RefusalAdvice>> = {
     next: () => ({ tool: 'doctor', arguments: { include_remediation: true } }),
   },
   accessibility_permission_denied: {
-    hint: 'The host app lacks the Accessibility permission, so macOS discards its input. The person grants it in System Settings, then restarts the host.',
+    hint: 'The host app lacks the Accessibility permission (Device Control and Data Access on macOS 27), so macOS discards its input. The person grants it in System Settings, then restarts the host.',
     next: () => ({ tool: 'doctor', arguments: { include_remediation: true } }),
   },
   helper_busy: {

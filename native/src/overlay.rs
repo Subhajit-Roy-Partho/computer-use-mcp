@@ -15,6 +15,9 @@ mod macos {
     const NS_BACKING_STORE_BUFFERED: u64 = 2;
     const NS_NONACTIVATING_PANEL_MASK: u64 = 1 << 7;
     const NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY: i64 = 1;
+    /// `NSWindowSharingNone`: 7.7.0 (M4) the pointer is drawn for the person, never into what the agent captures.
+    /// ScreenCaptureKit does not honour it on every release, so the capture helper also leaves this window out (K8).
+    const NS_WINDOW_SHARING_NONE: u64 = 0;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -168,6 +171,7 @@ mod macos {
         let _: () = msg_send![panel, setReleasedWhenClosed: NO];
         let _: () = msg_send![panel, setHidesOnDeactivate: NO];
         let _: () = msg_send![panel, setCanHide: NO];
+        let _: () = msg_send![panel, setSharingType: NS_WINDOW_SHARING_NONE];
         let behavior = COLLECTION_BEHAVIOR_ALL_SPACES
             | COLLECTION_BEHAVIOR_STATIONARY
             | COLLECTION_BEHAVIOR_IGNORES_CYCLE
@@ -232,7 +236,8 @@ mod macos {
                 "shape": "dot",
                 "nonActivating": true,
                 "alwaysOnTop": true,
-                "clickThrough": true
+                "clickThrough": true,
+                "excludedFromCapture": true
             }),
             None => serde_json::json!({
                 "supported": true,
@@ -241,7 +246,8 @@ mod macos {
                 "shape": "dot",
                 "nonActivating": true,
                 "alwaysOnTop": true,
-                "clickThrough": true
+                "clickThrough": true,
+                "excludedFromCapture": true
             }),
         }
     }
@@ -337,6 +343,7 @@ mod win {
         x: 0,
         y: 0,
         visible: false,
+        excluded_from_capture: false,
     });
 
     #[derive(Clone, Copy)]
@@ -345,6 +352,9 @@ mod win {
         x: i32,
         y: i32,
         visible: bool,
+        /// 7.7.0 (M4): `WDA_EXCLUDEFROMCAPTURE` took (Windows 10 2004 and later). Older builds have no equivalent:
+        /// `WDA_MONITOR` would put a black square in every capture, which is worse than the dot.
+        excluded_from_capture: bool,
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -447,8 +457,12 @@ mod win {
                 .unwrap_or_default();
                 if !hwnd.0.is_null() {
                     let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, 0, LWA_COLORKEY);
+                    // The pointer is for the person; captures (desktop duplication, BitBlt, Graphics Capture) skip it.
+                    let excluded = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok();
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    OVERLAY.lock().unwrap().hwnd = hwnd.0 as isize;
+                    let mut state = OVERLAY.lock().unwrap();
+                    state.hwnd = hwnd.0 as isize;
+                    state.excluded_from_capture = excluded;
                 }
 
                 // Only now is it safe for another thread to post to this window. The
@@ -515,7 +529,8 @@ mod win {
             "shape": "dot",
             "nonActivating": true,
             "alwaysOnTop": true,
-            "clickThrough": true
+            "clickThrough": true,
+            "excludedFromCapture": state.excluded_from_capture
         })
     }
 
