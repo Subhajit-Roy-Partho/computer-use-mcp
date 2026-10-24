@@ -48,6 +48,16 @@ for _ in 0..<40 {
     usleep(15_000)
 }
 `
+/** A person's click, from another process (the server's own latch refuses this process's input after Stop). */
+const PERSON_CLICKS = `import CoreGraphics
+import Foundation
+let point = CGPoint(x: Double(CommandLine.arguments[1])!, y: Double(CommandLine.arguments[2])!)
+let source = CGEventSource(stateID: .hidSystemState)
+for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
+    CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left)!.post(tap: .cghidEventTap)
+    usleep(80_000)
+}
+`
 
 const server = createComputerUseServer({ profile: 'full' })
 const client = await connectInProcess(server)
@@ -150,17 +160,22 @@ try {
   const cardWords = screenText.filter(t => /Agent is using this Mac|Agent paused|Agent stopped/i.test(t))
   check('screenshot OCR works', screenText.length > 0, `${screenText.length} lines`)
   check('the card is absent from the screenshot', cardWords.length === 0, cardWords.join(' | ') || 'no card text found')
-  check('screenshot ignored the session target (full_screen)', /screen \d+x\d+/.test(text(shot)) && !/window \d+ at/.test(text(shot)), text(shot).split('\n')[0])
+  // 7.7: a display capture says "screen: display N ... (ScreenCaptureKit)"; the native fallback says "screen WxH".
+  check('screenshot ignored the session target (full_screen)', /screen: display \d+|screen \d+x\d+/.test(text(shot)) && !/window \d+ at/.test(text(shot)), text(shot).split('\n')[0])
 
-  // 7. 7.7.0 (K5): a person taking over mid-action pauses the agent, and it resumes once they stop.
+  // 7. 7.7.0 (K5): a person taking over mid-action pauses the agent, and it resumes once they stop. The "person" is a
+  // small program compiled before the hold, so it moves the mouse as soon as it starts.
+  const compiled = async (name, source) => {
+    writeFileSync(join(scratch, `${name}.swift`), source)
+    await execFileAsync('xcrun', ['swiftc', '-O', '-o', join(scratch, name), join(scratch, `${name}.swift`)], { timeout: 120_000 })
+    return join(scratch, name)
+  }
+  const person = await compiled('person', PERSON_MOVES)
+  const personClicker = await compiled('person-click', PERSON_CLICKS)
   const holdStarted = Date.now()
   const held = whenIdle('hold_key', { keys: ['shift'], duration: 6, target_app: CALC })
-  await sleep(700)
-  await execFileAsync('xcrun', ['swift', '-'], { input: PERSON_MOVES }).catch(async () => {
-    const file = join(scratch, 'person.swift')
-    writeFileSync(file, PERSON_MOVES)
-    await execFileAsync('xcrun', ['swift', file])
-  })
+  await sleep(800)
+  await execFileAsync(person, [], { timeout: 10_000 })
   const heldResult = await held
   const heldFor = Date.now() - holdStarted
   status = parse(await client.callTool('control_status', {}))
@@ -194,7 +209,8 @@ try {
   const readAfter = parse(await client.callTool('list_windows', {}))
   check('reads still work after Stop', Array.isArray(readAfter.windows))
   // 7.7.0: after Stop the button reads Close; it dismisses the card and the agent stays stopped.
-  personClicks(centre(card.buttons.stop))
+  const close = centre(card.buttons.stop)
+  await execFileAsync(personClicker, [String(close.x), String(close.y)], { timeout: 10_000 })
   await sleep(1000)
   const cardLeft = (() => { try { return execSync('pgrep -fl macos-status-card', { encoding: 'utf8' }).trim() } catch { return '' } })()
   check('Close dismisses the card after Stop', cardLeft === '', cardLeft)
