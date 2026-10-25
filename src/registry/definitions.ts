@@ -294,6 +294,7 @@ export function defineV7Tools(registry: Pick<ToolRegistry, 'define' | 'getMeta'>
     label: z.string().describe('Element label — matched against AXTitle/AXDescription'),
     focus_strategy: focusStrategyParam,
     force: forceParam,
+    delivery: deliveryParam,
   }, AX_MUT)
   tool('set_value', 'Set a UI element\'s value directly (e.g. text field content). Avoids the click → type dance. Defaults to strict focus since it writes text.', {
     window_id: z.number().int().describe('CGWindowID of the window containing the element'),

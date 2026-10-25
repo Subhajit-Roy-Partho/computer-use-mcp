@@ -29,7 +29,7 @@ function context(service, overrides = {}) {
   return {
     native: service,
     targets: new TargetStateController(service, () => 1),
-    focus: { strategyFor: () => 'strict', ensure: async () => ({}), beginDispatch() {}, hiddenBundleIds() {} },
+    focus: { strategyFor: (_tool, args) => args?.focus_strategy ?? 'strict', ensure: async () => ({}), beginDispatch() {}, hiddenBundleIds() {} },
     activeProfile: 'full', sleep: async () => {},
     runScript: async () => ({ stdout: 'output\n', stderr: '', code: 0, timedOut: false }),
     getAppDictionary: async bundleId => ({ dict: { bundleId, suites: [] } }),
@@ -95,6 +95,63 @@ test('7.6.1: without an input handler the fallback is a structured refusal, neve
   assert.equal(result.isError, true)
   assert.equal(JSON.parse(result.content[0].text).error, 'input_unavailable')
   assert.deepEqual(service.calls, [])
+})
+
+// ── focus_strategy "none" skips the HID coordinate fallback ─────────────────
+// The fallback is a real cursor-moving click on the frontmost app. With "none"
+// the caller promised no focus steal, so refuse unless delivery "pid" routes
+// the fallback through the target process instead.
+
+test('click_element with focus_strategy none refuses the HID fallback without moving the cursor', async () => {
+  const service = native({
+    performAction: () => ({
+      performed: false, reason: 'unsupported_action',
+      bounds: { x: 10, y: 20, width: 30, height: 40 },
+    }),
+    getDisplaySize: () => ({ width: 1440, height: 900, scaleFactor: 2 }),
+    listDisplays: () => [{ x: 0, y: 0, width: 1440, height: 900 }],
+  })
+  const ctx = context(service)
+  let guardReads = 0
+  const guard = { activity: () => { guardReads++; return { msSinceInput: 60_000, thresholdMs: 4000, active: false } }, check: () => {}, status: () => ({}) }
+  ctx.input = new InputHandler({ native: service, targets: ctx.targets, focus: ctx.focus, sleep: async () => {}, guard })
+  const result = await handleAccessibilityTool('click_element', {
+    window_id: 42, role: 'AXButton', label: 'Submit', focus_strategy: 'none',
+  }, ctx)
+  assert.equal(result.isError, true)
+  assert.equal(JSON.parse(result.content[0].text).error, 'focus_strategy_none_no_hid')
+  assert.deepEqual(service.calls, [], 'no cursor motion and no click were posted')
+})
+
+test('click_element with focus_strategy none and delivery pid falls back through the process', async () => {
+  const service = native({
+    getWindow: id => id === 42 ? { windowId: 42, pid: 4242, bundleId: 'app.fixture', isOnScreen: true, bounds: { x: 0, y: 0, width: 1440, height: 900 } } : null,
+    performAction: () => ({
+      performed: false, reason: 'unsupported_action',
+      bounds: { x: 10, y: 20, width: 30, height: 40 },
+    }),
+    getDisplaySize: () => ({ width: 1440, height: 900, scaleFactor: 2 }),
+    listDisplays: () => [{ x: 0, y: 0, width: 1440, height: 900 }],
+    listRunningApps: () => [{ bundleId: 'app.fixture', pid: 4242 }],
+    mouseClickToPid: (...args) => service.calls.push(['clickToPid', ...args]),
+    keyPressToPid: (...args) => service.calls.push(['keyToPid', ...args]),
+    typeTextToPid: (...args) => service.calls.push(['typeToPid', ...args]),
+  })
+  const ctx = context(service, { platform: 'darwin' })
+  ctx.input = new InputHandler({
+    native: { ...service, mouseClickToPid: (...args) => service.calls.push(['clickToPid', ...args]),
+      keyPressToPid: (...args) => service.calls.push(['keyToPid', ...args]),
+      typeTextToPid: (...args) => service.calls.push(['typeToPid', ...args]) },
+    targets: ctx.targets, focus: ctx.focus, platform: 'darwin', sleep: async () => {},
+  })
+  const result = await handleAccessibilityTool('click_element', {
+    window_id: 42, role: 'AXButton', label: 'Submit', focus_strategy: 'none', delivery: 'pid',
+  }, ctx)
+  assert.equal(result.isError, undefined)
+  assert.match(result.content[0].text, /coordinate fallback/)
+  const pidClick = service.calls.find(c => c[0] === 'clickToPid')
+  assert.ok(pidClick, 'the fallback posted to the process')
+  assert.equal(service.calls.some(c => c[0] === 'mouseMove' || c[0] === 'mouseClick'), false, 'no HID cursor motion')
 })
 
 test('extracted accessibility miss returns ranked label recovery candidates', async () => {

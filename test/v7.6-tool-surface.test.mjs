@@ -103,7 +103,7 @@ test('click dispatches button and count and validates them; aliases still work w
     findElement: () => [],
   }
   const targets = new TargetStateController(native, () => 100)
-  const handler = new InputHandler({ native, targets, focus: { strategyFor: () => 'none', ensure: async () => ({}) }, platform: 'linux', sleep: async () => {} })
+  const handler = new InputHandler({ native, targets, focus: { strategyFor: (_tool, args) => args?.focus_strategy ?? 'best_effort', ensure: async () => ({}) }, platform: 'linux', sleep: async () => {} })
   await handler.handle('click', { coordinate: [10, 20], button: 'right', count: 2 })
   assert.deepEqual(calls.at(-1), ['click', 10, 20, 'right', 2])
   await handler.handle('click', { coordinate: [10, 20] })
